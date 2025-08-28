@@ -1,8 +1,6 @@
 import re
 import logging
 import os
-import time
-import asyncio
 from telethon import events
 from .telegram_handler import TelegramHandler
 from .youtube_handler import YouTubeHandler
@@ -206,7 +204,7 @@ class EventHandler:
             target_chat = transfer.get("target_chat")
             include_keywords = transfer.get("include_keywords", [])
 
-        # 检查是否匹配源聊天
+            # 检查是否匹配源聊天
             if str(chat_id) == str(source_chat):
                 # 检查是否需要根据关键词过滤
                 should_transfer = True
@@ -305,50 +303,22 @@ class EventHandler:
                 await event.reply(f"YouTube下载失败: {error_msg}")
 
     async def _handle_telegram_media(self, event):
-        """处理Telegram媒体消息（带进度与耗时）"""
+        """处理Telegram媒体消息"""
         status_message = await event.reply("开始下载媒体文件...")
-        start_time = time.time()
-
-        # 进度节流控制
-        last = {"t": 0.0, "p": -1.0}  # 上次更新时间、上次百分比
-
-        def progress_callback(received: int, total: int):
-            try:
-                percent = (received / total * 100) if total else 0.0
-                now = time.time()
-                # 每 0.5s 或进度提升 >=1% 才更新一次，避免刷屏
-                if (now - last["t"] >= 0.5) or (percent - last["p"] >= 1.0) or received == total:
-                    elapsed = now - start_time
-                    msg = (
-                        f"⏳ 下载中... {percent:.2f}% "
-                        f"({received // (1024*1024)}MB / {total // (1024*1024) if total else 0}MB)\n"
-                        f"已用时: {elapsed:.1f} 秒"
-                    )
-                    last["t"] = now
-                    last["p"] = percent
-                    # 回调是同步函数，不能直接 await，这里用 create_task
-                    asyncio.create_task(status_message.edit(msg))
-            except Exception as e:
-                logger.debug(f"更新进度失败（忽略）：{e}")
-
         try:
-            success, result = await self.telegram_handler.process_media(
-                event, progress_callback=progress_callback
-            )
-            elapsed = time.time() - start_time
+            success, result = await self.telegram_handler.process_media(event)
 
             if success:
-                await status_message.edit(
+                await event.reply(
                     f"✅ {result['type']} 文件下载完成！\n"
                     f"文件名: {result['filename']}\n"
-                    f"保存位置: {result['path']}\n"
-                    f"耗时: {elapsed:.1f} 秒"
+                    f"保存位置: {result['path']}"
                 )
                 # await self.send_video_to_user(event, result["path"])
             else:
-                await status_message.edit(f"❌ 下载失败: {result}\n耗时: {elapsed:.1f} 秒")
+                await event.reply(f"❌ 下载失败: {result}")
         except Exception as e:
-            await status_message.edit(f"处理媒体文件时出错: {str(e)}")
+            await event.reply(f"处理媒体文件时出错: {str(e)}")
 
     async def handle_bilibili_message(self, message):
         """处理消息"""
