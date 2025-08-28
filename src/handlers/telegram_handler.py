@@ -66,7 +66,7 @@ class TelegramHandler:
         return message_text or f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     def _extract_title(self, message_text: str) -> str:
-        """提取转发消息中的标题文本"""
+        """提取转发消息中的标题文本（首行），并移除非法字符"""
         if not message_text:
             return None
         first_line = message_text.strip().split("\n")[0]
@@ -94,7 +94,7 @@ class TelegramHandler:
             if (
                 not re.search("[\u4e00-\u9fff]+", filename)
                 or f"{datetime.now().strftime('%Y%m%d_%H%M%S')}" in filename
-            ) and re.search(r"[\u4e00-\u9fff]+", event.message.message):
+            ) and re.search(r"[\u4e00-\u9fff]+", event.message.message or ""):
                 filename = event.message.message
 
             # -----------------------------
@@ -108,7 +108,7 @@ class TelegramHandler:
 
                 # 获取扩展名
                 for attr in document.attributes:
-                    if hasattr(attr, "file_name") and "." in attr.file_name:
+                    if hasattr(attr, "file_name") and attr.file_name and "." in attr.file_name:
                         ext = os.path.splitext(attr.file_name)[1]
                         break
                 if not ext and media.document.mime_type:
@@ -118,25 +118,26 @@ class TelegramHandler:
                     TELEGRAM_TEMP_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.tmp"
                 )
 
-                # ✅ 使用并发分块下载 + 进度回调
+                # 使用 Telethon 的 download_file（支持 progress_callback、part_size_kb）
                 await event.client.download_file(
                     document,
                     file=temp_file,
-                    request_size=1024 * 1024 * 2,  # 2MB per chunk
-                    parallel=4,  # 4 个并发
-                    progress_callback=progress_callback,
+                    part_size_kb=512,                # 每块 512 KB
+                    progress_callback=progress_callback,  # 回调签名: (received, total)
                 )
                 downloaded_file = temp_file
 
             elif isinstance(media, MessageMediaPhoto):
                 ext = ".jpg"
                 downloaded_file = await event.message.download_media(
-                    file=TELEGRAM_TEMP_DIR, progress_callback=progress_callback
+                    file=TELEGRAM_TEMP_DIR,
+                    progress_callback=progress_callback,
                 )
 
             else:
                 downloaded_file = await event.message.download_media(
-                    file=TELEGRAM_TEMP_DIR, progress_callback=progress_callback
+                    file=TELEGRAM_TEMP_DIR,
+                    progress_callback=progress_callback,
                 )
                 ext = os.path.splitext(downloaded_file)[1]
 
