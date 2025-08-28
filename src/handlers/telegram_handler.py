@@ -72,7 +72,7 @@ class TelegramHandler:
         first_line = message_text.strip().split("\n")[0]
         return re.sub(r'[\\/:*?"<>|]', "_", first_line).strip()
 
-    async def process_media(self, event):
+    async def process_media(self, event, progress_callback=None):
         """处理Telegram媒体消息"""
         try:
             media = event.message.media
@@ -118,21 +118,26 @@ class TelegramHandler:
                     TELEGRAM_TEMP_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.tmp"
                 )
 
-                # ✅ 使用并发分块下载视频/大文件
+                # ✅ 使用并发分块下载 + 进度回调
                 await event.client.download_file(
                     document,
                     file=temp_file,
                     request_size=1024 * 1024 * 2,  # 2MB per chunk
                     parallel=4,  # 4 个并发
+                    progress_callback=progress_callback,
                 )
                 downloaded_file = temp_file
 
             elif isinstance(media, MessageMediaPhoto):
                 ext = ".jpg"
-                downloaded_file = await event.message.download_media(file=TELEGRAM_TEMP_DIR)
+                downloaded_file = await event.message.download_media(
+                    file=TELEGRAM_TEMP_DIR, progress_callback=progress_callback
+                )
 
             else:
-                downloaded_file = await event.message.download_media(file=TELEGRAM_TEMP_DIR)
+                downloaded_file = await event.message.download_media(
+                    file=TELEGRAM_TEMP_DIR, progress_callback=progress_callback
+                )
                 ext = os.path.splitext(downloaded_file)[1]
 
             if not downloaded_file:
