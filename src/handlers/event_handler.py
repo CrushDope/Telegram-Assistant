@@ -174,8 +174,8 @@ class EventHandler:
                 is_youtube = bool(re.match(youtube_pattern, message_text))
                 is_douyin = bool(re.search(douyin_pattern, message_text))
                 is_bilibili = (
-                    "bilibili.com" in message_text
-                    or "b23.tv" in message_text
+                    "bilibili.com" in event.message.text
+                    or "b23.tv" in event.message.text
                 )
                 if is_youtube:
                     await self._handle_youtube_message(event)
@@ -315,7 +315,7 @@ class EventHandler:
                     f"✅ {result.get('type', 'file')} 文件下载完成！\n"
                     f"文件名: {result.get('filename')}\n"
                     f"保存位置: {result.get('path')}\n"
-                    f"耗时: {elapsed_str}"
+                    f"下载耗时: {elapsed_str}"
                 )
                 # await self.send_video_to_user(event, result["path"])
             else:
