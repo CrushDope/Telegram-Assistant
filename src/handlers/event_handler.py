@@ -1,349 +1,205 @@
+import os
 import re
 import logging
-import os
-from telethon import events
-from .telegram_handler import TelegramHandler
-from .youtube_handler import YouTubeHandler
-from .douyin_handler import CustomDouyinHandler
-from .bilibili_handler import BilibiliHandler
+from datetime import datetime
+from ..utils.file_utils import move_file
+from ..constants import (
+    TELEGRAM_TEMP_DIR,
+    TELEGRAM_VIDEOS_DIR,
+    TELEGRAM_AUDIOS_DIR,
+    TELEGRAM_PHOTOS_DIR,
+    TELEGRAM_OTHERS_DIR,
+    DOUYIN_DEST_DIR,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class EventHandler:
+class TelegramHandler:
     def __init__(self, config):
         self.config = config
-        self.telegram_handler = TelegramHandler(config)
-        self.youtube_handler = YouTubeHandler(config)
-        self.douyin_handler = CustomDouyinHandler(
-            config.get("douyin", {}).get("cookie")
-        )
-        self.bilibili_handler = BilibiliHandler(config.get("bilibili", {}))
-        self.send_file = config.get("send_file", False)
-        self.transfer_config = config.get("transfer_message", [])
+        self._ensure_directories()
 
-        # 创建临时目录
-        self.temp_dir = os.path.join(
-            os.path.dirname(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            ),
-            "temp",
-        )
-        if not os.path.exists(self.temp_dir):
-            os.makedirs(self.temp_dir)
+    def _ensure_directories(self):
+        """确保所有必要的目录存在"""
+        for directory in [
+            TELEGRAM_TEMP_DIR,
+            TELEGRAM_VIDEOS_DIR,
+            TELEGRAM_AUDIOS_DIR,
+            TELEGRAM_PHOTOS_DIR,
+            TELEGRAM_OTHERS_DIR,
+            DOUYIN_DEST_DIR,
+        ]:
+            os.makedirs(directory, exist_ok=True)
 
-    async def send_video_to_user(self, event, file_path):
-        """统一的发送文件方法"""
-        if self.send_file:
-            # 判断是视频还是音频
-            is_audio = file_path.lower().endswith(
-                (".mp3", ".m4a", ".ogg", ".wav", ".flac")
-            )
+    def _extract_title_and_intro(self, message_text):
+        """提取标题和简介"""
+        if not message_text or not message_text.strip():
+            return None, None
 
-            if is_audio:
-                # 音频文件
-                await event.client.send_file(
-                    event.chat_id,
-                    file_path,
-                    force_document=False,
-                    attributes=[],  # 音频属性
-                )
+        # 匹配格式：忽略【前面的内容，只取影视名字
+        pattern = r'【[^】]+】(.+?)(?=\n|$)'
+        match = re.search(pattern, message_text)
+        title, intro = None, None
+
+        if match:
+            title = match.group(1).strip()
+            title = self._sanitize_filename(title)
+
+            # 剩余部分作为简介
+            split_text = message_text.split(match.group(0), 1)
+            if len(split_text) > 1:
+                intro = split_text[1].strip()
+        else:
+            # 如果没匹配到，用第一行作为标题
+            lines = message_text.strip().split("\n", 1)
+            title = self._sanitize_filename(lines[0])
+            if len(lines) > 1:
+                intro = lines[1].strip()
+
+        return title, intro
+
+    def _should_download_file(self, media):
+        """跳过以photo_开头的文件"""
+        if hasattr(media, "document"):
+            for attr in media.document.attributes:
+                if hasattr(attr, "file_name") and attr.file_name:
+                    if attr.file_name.startswith("photo_"):
+                        logger.info(f"跳过以photo_开头的文件: {attr.file_name}")
+                        return False
+        return True
+
+    def _get_media_type_and_dir(self, media, title):
+        """确定媒体类型和目标目录"""
+        if hasattr(media, "document"):
+            mime_type = media.document.mime_type
+            if mime_type:
+                if mime_type.startswith("video/"):
+                    title_dir = os.path.join(TELEGRAM_VIDEOS_DIR, title)
+                    os.makedirs(title_dir, exist_ok=True)
+                    return "video", title_dir
+                elif mime_type.startswith("audio/"):
+                    return "audio", TELEGRAM_AUDIOS_DIR
+            return "other", TELEGRAM_OTHERS_DIR
+        elif hasattr(media, "photo"):
+            title_dir = os.path.join(TELEGRAM_VIDEOS_DIR, title)
+            os.makedirs(title_dir, exist_ok=True)
+            return "photo", title_dir
+        return "other", TELEGRAM_OTHERS_DIR
+
+    def _get_file_extension(self, media):
+        """获取文件扩展名"""
+        if hasattr(media, "document") and hasattr(media.document, "mime_type"):
+            mime_type = media.document.mime_type
+            if mime_type:
+                mime_to_ext = {
+                    'video/mp4': '.mp4',
+                    'video/quicktime': '.mov',
+                    'video/x-msvideo': '.avi',
+                    'video/x-matroska': '.mkv',
+                    'video/webm': '.webm',
+                    'audio/mpeg': '.mp3',
+                    'audio/x-wav': '.wav',
+                    'audio/x-flac': '.flac',
+                    'audio/m4a': '.m4a',
+                    'image/jpeg': '.jpg',
+                    'image/png': '.png',
+                    'image/gif': '.gif',
+                    'image/webp': '.webp',
+                }
+                return mime_to_ext.get(mime_type, f".{mime_type.split('/')[-1]}")
+        elif hasattr(media, "photo"):
+            return '.jpg'
+        return '.bin'
+
+    def _sanitize_filename(self, filename):
+        """清理文件名"""
+        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        filename = filename.strip('. ')
+        if len(filename) > 100:
+            filename = filename[:100]
+        return filename
+
+    def _get_filename(self, media, title, is_first_photo=False):
+        """获取文件名"""
+        if hasattr(media, "document") and media.document.mime_type.startswith("video/"):
+            ext = self._get_file_extension(media)
+            return f"{title}{ext}"
+
+        if hasattr(media, "photo"):
+            if is_first_photo:
+                return "fanart.jpg"
             else:
-                # 视频或其他文件
-                await event.client.send_file(
-                    event.chat_id,
-                    file_path,
-                    supports_streaming=True,
-                    force_document=False,
-                )
+                # 尝试使用原始文件名
+                if hasattr(media, "document"):
+                    for attr in media.document.attributes:
+                        if hasattr(attr, "file_name") and attr.file_name:
+                            return attr.file_name
+                return f"image_{datetime.now().strftime('%H%M%S')}.jpg"
 
-    def register_message_transfer(self, client):
-        """注册消息转发处理程序（适用于用户客户端）"""
-        if not self.transfer_config:
-            logger.info("未配置消息转发规则，跳过注册转发处理程序")
-            return
+        ext = self._get_file_extension(media)
+        return f"file_{datetime.now().strftime('%H%M%S')}{ext}"
 
-        logger.info(
-            f"正在注册消息转发处理程序，共有 {len(self.transfer_config)} 条规则"
-        )
-
-        @client.on(events.NewMessage)
-        async def handle_message_transfer(event):
-            """处理来自任何聊天的新消息并进行转发"""
-            try:
-                # 获取当前聊天的ID
-                chat = await event.get_chat()
-                group_id = event.chat_id
-                chat_username = getattr(chat, "username", None)
-
-                # 遍历转发配置
-                for transfer in self.transfer_config:
-                    source_chat = transfer.get("source_chat")
-
-                    # 检查是否匹配源聊天（通过ID或用户名）
-                    source_match = False
-                    if source_chat and (
-                        str(group_id) == str(source_chat)
-                        or (chat_username and f"@{chat_username}" == source_chat)
-                    ):
-                        source_match = True
-
-                    if source_match:
-                        target_chat = transfer.get("target_chat")
-                        include_keywords = transfer.get("include_keywords", [])
-                        direct = transfer.get("direct", False)
-                        # 检查是否需要根据关键词过滤
-                        should_transfer = True
-                        if include_keywords:
-                            message_text = (
-                                event.message.text if event.message.text else ""
-                            )
-                            # 如果指定了关键词，至少匹配一个关键词才转发
-                            should_transfer = any(
-                                keyword in message_text for keyword in include_keywords
-                            )
-
-                        if should_transfer:
-                            try:
-                                if direct:
-                                    logger.info(f"直接转发消息: {event.message.text}")
-                                    # 检查消息是否包含photo
-                                    if event.message.photo:
-                                        # 如果有照片，下载到临时文件再发送
-                                        temp_file_path = os.path.join(
-                                            self.temp_dir,
-                                            f"photo_{event.message.id}.jpg",
-                                        )
-                                        await event.message.download_media(
-                                            temp_file_path
-                                        )
-
-                                        # 发送文本和照片
-                                        await client.send_message(
-                                            target_chat,
-                                            (
-                                                event.message.text
-                                                if event.message.text
-                                                else ""
-                                            ),
-                                            file=temp_file_path,
-                                        )
-
-                                        # 删除临时文件
-                                        if os.path.exists(temp_file_path):
-                                            os.remove(temp_file_path)
-                                    else:
-                                        # 没有照片，只发送文本
-                                        await client.send_message(
-                                            target_chat, event.message.text
-                                        )
-                                else:
-                                    # 转发消息
-                                    await client.forward_messages(
-                                        target_chat, event.message
-                                    )
-                                    logger.info(
-                                        f"已将消息从 {source_chat} 转发到 {target_chat}"
-                                    )
-                            except Exception as e:
-                                logger.error(f"转发消息时出错: {str(e)}")
-
-            except Exception as e:
-                logger.error(f"处理消息转发时出错: {str(e)}")
-
-    def register_handlers(self, client):
-        """注册所有事件处理器"""
-
-        @client.on(events.NewMessage(pattern="/start"))
-        async def start(event):
-            """处理 /start 命令"""
-            await event.reply("你好！请转发视频给我，我会自动下载到指定文件夹。")
-
-        @client.on(events.NewMessage)
-        async def handle_message(event):
-            """处理新消息"""
-            try:
-                # 先检查是否需要转发消息
-                await self._handle_message_transfer(event)
-
-                message_text = event.message.text if event.message.text else ""
-
-                # 检查是否是YouTube链接
-                youtube_pattern = r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.*|(https?://)?(m\.)?(youtube\.com|youtu\.be)/.*"
-                douyin_pattern = r"https://v\.douyin\.com/.*?/"
-                is_youtube = bool(re.match(youtube_pattern, message_text))
-                is_douyin = bool(re.search(douyin_pattern, message_text))
-                is_bilibili = (
-                    "bilibili.com" in message_text
-                    or "b23.tv" in message_text
-                )
-                if is_youtube:
-                    await self._handle_youtube_message(event)
-                elif is_douyin:
-                    await self._handle_douyin_message(event)
-                elif is_bilibili:
-                    await self.handle_bilibili_message(event)
-                elif event.message.media:
-                    await self._handle_telegram_media(event)
-
-            except Exception as e:
-                logger.error(f"处理消息时出错: {str(e)}")
-                await event.reply(f"处理消息时出错: {str(e)}")
-
-    async def _handle_message_transfer(self, event):
-        """处理消息转发（适用于机器人客户端）"""
-        if not self.transfer_config:
-            return
-
-        # 获取当前聊天的ID
-        chat_id = event.chat_id
-
-        # 遍历转发配置
-        for transfer in self.transfer_config:
-            source_chat = transfer.get("source_chat")
-            target_chat = transfer.get("target_chat")
-            include_keywords = transfer.get("include_keywords", [])
-
-            # 检查是否匹配源聊天
-            if str(chat_id) == str(source_chat):
-                # 检查是否需要根据关键词过滤
-                should_transfer = True
-                if include_keywords:
-                    message_text = event.message.text if event.message.text else ""
-                    # 如果指定了关键词，至少匹配一个关键词才转发
-                    should_transfer = any(
-                        keyword in message_text for keyword in include_keywords
-                    )
-
-                if should_transfer:
-                    try:
-                        # 检查消息是否包含photo
-                        if event.message.photo:
-                            # 如果有照片，下载到临时文件再发送
-                            temp_file_path = os.path.join(
-                                self.temp_dir, f"photo_{event.message.id}.jpg"
-                            )
-                            await event.message.download_media(temp_file_path)
-
-                            # 发送文本和照片
-                            await event.client.send_message(
-                                target_chat,
-                                (event.message.text if event.message.text else ""),
-                                file=temp_file_path,
-                            )
-
-                            # 删除临时文件
-                            if os.path.exists(temp_file_path):
-                                os.remove(temp_file_path)
-
-                            logger.info(
-                                f"已将图文消息从 {source_chat} 发送到 {target_chat}"
-                            )
-                        else:
-                            # 转发消息
-                            await event.client.forward_messages(
-                                target_chat, event.message
-                            )
-                            logger.info(
-                                f"已将消息从 {source_chat} 转发到 {target_chat}"
-                            )
-                    except Exception as e:
-                        logger.error(f"转发消息时出错: {str(e)}")
-
-    async def _handle_douyin_message(self, event):
-        try:
-            match = re.findall(r"https?://v\.douyin\.com/.*?/", event.message.text)
-            if match:
-                await event.reply(f"开始下载抖音视频: {match[0]}")
-                url = match[0]
-                video = await self.douyin_handler.download_video(url)
-                if video:
-                    await event.reply(
-                        f"✅ 抖音视频下载完成！\n"
-                        f"标题: {video.get('desc')}\n"
-                        f"保存位置: {video.get('dest_path')}"
-                    )
-                    # await self.send_video_to_user(event, video.get("dest_path"))
-                else:
-                    await event.reply("无法下载该抖音视频，请检查链接是否有效。")
-            else:
-                await event.reply("无法下载该抖音视频，请检查链接是否有效。")
-        except Exception as e:
-            await event.reply(f"下载抖音视频时出错: {str(e)}")
-
-    async def _handle_youtube_message(self, event):
-        """处理YouTube链接消息"""
-        status_message = await event.reply("开始解析YouTube下载链接...")
-        try:
-            success, result = await self.youtube_handler.download_video(
-                event.message.text,
-                lambda msg: status_message.edit(msg) if status_message else None,
-            )
-
-            if success:
-                # 判断下载的文件类型
-                file_type = "视频"
-                if result.lower().endswith((".mp3", ".m4a", ".ogg", ".wav", ".flac")):
-                    file_type = "音频"
-
-                await event.reply(
-                    f"✅ YouTube{file_type}下载完成！\n" f"保存位置: {result}"
-                )
-                # await self.send_video_to_user(event, result)
-            else:
-                await event.reply(f"❌ YouTube视频下载失败！\n" f"错误: {result}")
-        except Exception as e:
-            error_msg = str(e)
-            if "Sign in to confirm you're not a bot" in error_msg:
-                await event.reply(
-                    "YouTube下载失败: 需要验证。\n"
-                    "请检查配置文件中的 youtube_download.cookies 是否正确设置。"
-                )
-            else:
-                await event.reply(f"YouTube下载失败: {error_msg}")
-
-    async def _handle_telegram_media(self, event):
+    async def process_media(self, event):
         """处理Telegram媒体消息"""
-        status_message = await event.reply("开始下载媒体文件...")
         try:
-            success, result = await self.telegram_handler.process_media(event)
+            media = event.message.media
+            if not media:
+                return False, "没有检测到媒体文件"
+
+            # 跳过 photo_ 开头的文件
+            if not self._should_download_file(media):
+                return False, "跳过以photo_开头的文件"
+
+            # 提取标题和简介
+            message_text = event.message.text or ""
+            title, intro = self._extract_title_and_intro(message_text)
+            if not title:
+                title = f"media_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            # 判断是否是第一张图片
+            is_first_photo = False
+            if hasattr(media, "photo"):
+                target_dir = os.path.join(TELEGRAM_VIDEOS_DIR, title)
+                fanart_path = os.path.join(target_dir, "fanart.jpg")
+                is_first_photo = not os.path.exists(fanart_path)
+
+            # 获取文件名
+            filename = self._get_filename(media, title, is_first_photo)
+
+            # 获取媒体类型和目标目录
+            media_type, target_dir = self._get_media_type_and_dir(media, title)
+
+            # 下载文件
+            downloaded_file = await event.message.download_media(file=TELEGRAM_TEMP_DIR)
+            if not downloaded_file:
+                return False, "文件下载失败"
+
+            target_path = os.path.join(target_dir, filename)
+
+            # 处理重名（fanart.jpg 除外）
+            if filename != "fanart.jpg":
+                counter = 1
+                base, ext = os.path.splitext(target_path)
+                while os.path.exists(target_path):
+                    target_path = f"{base}_{counter}{ext}"
+                    counter += 1
+
+            success, result = move_file(downloaded_file, target_path)
 
             if success:
-                elapsed = result.get("elapsed")
-                elapsed_text = f"\n下载耗时: {elapsed:.2f} 秒" if elapsed is not None else ""
-                await event.reply(
-                    f"✅ {result['type']} 文件下载完成！\n"
-                    f"文件名: {result['filename']}\n"
-                    f"保存位置: {result['path']}"
-                    f"{elapsed_text}"
-                )
-                # await self.send_video_to_user(event, result["path"])
+                logger.info(f"成功处理媒体文件: {title}/{filename}")
+                return True, {
+                    "type": media_type,
+                    "title": title,
+                    "intro": intro,
+                    "path": result,
+                    "filename": filename,
+                    "directory": target_dir
+                }
             else:
-                await event.reply(f"❌ 下载失败: {result}")
-        except Exception as e:
-            await event.reply(f"处理媒体文件时出错: {str(e)}")
-
-    async def handle_bilibili_message(self, message):
-        """处理消息"""
-        try:
-            await message.reply("正在下载B站视频，请稍候...")
-            url = re.findall(
-                r"https://www\.bilibili\.com/video/.*|https://b23\.tv/.*", message.text
-            )
-            if url:
-                video = await self.bilibili_handler.download_video(url[0])
-                if video:
-                    await message.reply(
-                        f"✅ B站视频下载完成！\n"
-                        f"标题: {video.get('title')}\n"
-                        f"保存位置: {video.get('path')}"
-                    )
-                    # await self.send_video_to_user(message, video.get("path"))
-                    return True
-            else:
-                await message.reply("下载B站视频失败,请检查链接是否有效")
-                return False
+                return False, f"移动文件失败: {result}"
 
         except Exception as e:
-            await message.reply(f"处理B站视频失败: {str(e)}")
-            return False
+            logger.error(f"处理Telegram媒体文件时出错: {str(e)}")
+            return False, str(e)
