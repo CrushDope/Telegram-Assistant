@@ -19,8 +19,6 @@ class TelegramHandler:
     def __init__(self, config):
         self.config = config
         self._ensure_directories()
-        # 用于跟踪每个消息的图片计数
-        self.photo_counters = {}
 
     def _ensure_directories(self):
         """确保所有必要的目录存在"""
@@ -34,65 +32,91 @@ class TelegramHandler:
         ]:
             os.makedirs(directory, exist_ok=True)
 
-    def _extract_title_from_message(self, message_text):
-        """从消息文本中提取标题和简介"""
+    def _extract_title(self, message_text):
+        """从消息文本中提取标题"""
         if not message_text or not message_text.strip():
-            return None, None
+            return None
         
-        # 匹配标题格式：两个表情 + 【品牌】+ 影视名字（中文+英文）
+        # 匹配格式：任意内容【品牌】标题内容
         # 例如: 🎬🔥【Dorcel啄木鸟】激情陷阱 Passion Trap (2023)
-        title_pattern = r'[�-🯿]{2}【([^】]+)】(.+?)(?=\n|$)'
+        title_pattern = r'.*?【([^】]+)】(.+?)(?=\n|$)'
         match = re.search(title_pattern, message_text)
         
         if match:
-            brand = match.group(1)  # 品牌部分，如：Dorcel啄木鸟
-            title_content = match.group(2).strip()  # 影视标题部分
-            
-            # 提取简介（标题后的所有内容）
-            description_start = match.end()
-            description = message_text[description_start:].strip()
-            
-            # 清理标题内容（移除可能的多余空格和换行）
+            title_content = match.group(2).strip()  # 提取标题部分
+            # 清理标题内容
             title_content = re.sub(r'\s+', ' ', title_content)
-            
-            return title_content, description
+            return self._sanitize_filename(title_content)
         
-        # 如果没有匹配到标准格式，尝试其他可能的格式
+        # 如果没有匹配到标准格式，使用第一行作为标题
         lines = message_text.strip().split('\n')
         if lines:
-            # 取第一行作为标题，剩余作为简介
             title_content = lines[0].strip()
-            description = '\n'.join(lines[1:]).strip() if len(lines) > 1 else ""
-            return title_content, description
+            return self._sanitize_filename(title_content)
         
-        return None, None
+        return None
 
-    def _get_media_type_and_dir(self, media, title):
-        """确定媒体类型和目标目录"""
+    def _sanitize_filename(self, filename):
+        """清理文件名，移除非法字符"""
+        # 移除文件系统非法字符
+        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        # 移除开头和结尾的点号和空格
+        filename = filename.strip('. ')
+        # 限制文件名长度
+        if len(filename) > 100:
+            filename = filename[:100]
+        return filename
+
+    def _should_download_file(self, media):
+        """判断是否应该下载该文件"""
         if hasattr(media, "document"):
-            mime_type = media.document.mime_type
-            if mime_type:
-                if mime_type.startswith("video/"):
-                    # 视频文件放在以标题命名的子目录中
-                    title_dir = os.path.join(TELEGRAM_VIDEOS_DIR, title)
-                    os.makedirs(title_dir, exist_ok=True)
-                    return "video", title_dir
-                elif mime_type.startswith("audio/"):
-                    return "audio", TELEGRAM_AUDIOS_DIR
-            return "other", TELEGRAM_OTHERS_DIR
+            # 检查文件名是否以photo_开头
+            for attr in media.document.attributes:
+                if hasattr(attr, "file_name") and attr.file_name:
+                    if attr.file_name.startswith('photo_'):
+                        logger.info(f"跳过以photo_开头的文件: {attr.file_name}")
+                        return False
+            return True
         elif hasattr(media, "photo"):
-            # 图片文件也放在以标题命名的子目录中
-            title_dir = os.path.join(TELEGRAM_VIDEOS_DIR, title)
-            os.makedirs(title_dir, exist_ok=True)
-            return "photo", title_dir
-        return "other", TELEGRAM_OTHERS_DIR
+            # 图片默认都下载
+            return True
+        return True
+
+    def _get_target_directory(self, title):
+        """获取目标目录（基于标题创建子文件夹）"""
+        target_dir = os.path.join(TELEGRAM_VIDEOS_DIR, title)
+        os.makedirs(target_dir, exist_ok=True)
+        return target_dir
+
+    def _get_filename(self, media, title, is_first_photo=False):
+        """获取文件名"""
+        if hasattr(media, "document") and hasattr(media.document, "mime_type"):
+            mime_type = media.document.mime_type
+            if mime_type and mime_type.startswith("video/"):
+                # 视频文件使用标题命名
+                ext = self._get_file_extension(media)
+                return f"{title}{ext}"
+        
+        elif hasattr(media, "photo"):
+            # 图片文件：第一张命名为fanart.jpg，其他保持原名
+            if is_first_photo:
+                return "fanart.jpg"
+            else:
+                # 尝试获取原始文件名
+                if hasattr(media, "document"):
+                    for attr in media.document.attributes:
+                        if hasattr(attr, "file_name") and attr.file_name:
+                            return attr.file_name
+        
+        # 默认命名
+        ext = self._get_file_extension(media)
+        return f"file_{datetime.now().strftime('%H%M%S')}{ext}"
 
     def _get_file_extension(self, media):
         """获取文件扩展名"""
         if hasattr(media, "document") and hasattr(media.document, "mime_type"):
             mime_type = media.document.mime_type
             if mime_type:
-                # 常见MIME类型映射
                 mime_to_ext = {
                     'video/mp4': '.mp4',
                     'video/quicktime': '.mov',
@@ -111,57 +135,7 @@ class TelegramHandler:
                 return mime_to_ext.get(mime_type, f".{mime_type.split('/')[-1]}")
         elif hasattr(media, "photo"):
             return '.jpg'
-        
         return '.bin'
-
-    def _sanitize_filename(self, filename):
-        """清理文件名，移除非法字符"""
-        # 移除文件系统非法字符
-        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-        # 移除开头和结尾的点号和空格
-        filename = filename.strip('. ')
-        # 限制文件名长度
-        if len(filename) > 100:
-            filename = filename[:100]
-        return filename
-
-    def _get_filename_for_media(self, media, title, message_id, is_video=False):
-        """根据媒体类型获取文件名"""
-        if is_video:
-            # 视频文件使用提取的标题命名
-            file_extension = self._get_file_extension(media)
-            return f"{title}{file_extension}"
-        
-        elif hasattr(media, "photo"):
-            # 图片文件处理
-            if message_id not in self.photo_counters:
-                self.photo_counters[message_id] = 0
-            
-            self.photo_counters[message_id] += 1
-            photo_count = self.photo_counters[message_id]
-            
-            if photo_count == 1:
-                # 第一张图片命名为fanart.jpg
-                return "fanart.jpg"
-            else:
-                # 其他图片保持原始文件名或使用默认命名
-                file_extension = self._get_file_extension(media)
-                # 尝试获取原始文件名
-                original_name = None
-                if hasattr(media, "document"):
-                    for attr in media.document.attributes:
-                        if hasattr(attr, "file_name") and attr.file_name:
-                            original_name = attr.file_name
-                            break
-                
-                if original_name:
-                    return original_name
-                else:
-                    return f"image_{photo_count}{file_extension}"
-        
-        # 其他类型文件
-        file_extension = self._get_file_extension(media)
-        return f"file_{datetime.now().strftime('%H%M%S')}{file_extension}"
 
     async def process_media(self, event):
         """处理Telegram媒体消息"""
@@ -170,15 +144,16 @@ class TelegramHandler:
             if not media:
                 return False, "没有检测到媒体文件"
 
-            message_id = event.message.id
-            message_text = event.message.text or ""
+            # 检查是否应该下载该文件
+            if not self._should_download_file(media):
+                return False, "跳过以photo_开头的文件"
 
-            # 提取标题和简介
-            title, description = self._extract_title_from_message(message_text)
+            # 提取标题
+            message_text = event.message.text or ""
+            title = self._extract_title(message_text)
             
             if not title:
-                # 如果没有提取到标题，使用备用方案
-                logger.warning(f"消息 {message_id} 中未提取到标题，使用备用命名")
+                # 备用标题生成
                 if hasattr(media, "document"):
                     for attr in media.document.attributes:
                         if hasattr(attr, "file_name") and attr.file_name:
@@ -189,35 +164,35 @@ class TelegramHandler:
                             break
                 
                 if not title:
-                    media_type = "video" if hasattr(media, "document") and media.document.mime_type.startswith("video/") else "photo"
-                    title = f"{media_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    title = f"media_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                
+                title = self._sanitize_filename(title)
 
-            # 清理标题
-            title = self._sanitize_filename(title)
+            # 创建目标目录
+            target_dir = self._get_target_directory(title)
 
-            # 判断是否是视频
-            is_video = hasattr(media, "document") and hasattr(media.document, "mime_type") and media.document.mime_type.startswith("video/")
+            # 判断是否是第一张图片
+            is_first_photo = False
+            if hasattr(media, "photo"):
+                # 检查目录中是否已经有fanart.jpg
+                fanart_path = os.path.join(target_dir, "fanart.jpg")
+                is_first_photo = not os.path.exists(fanart_path)
 
             # 获取文件名
-            filename = self._get_filename_for_media(media, title, message_id, is_video)
-
-            # 获取媒体类型和目标目录
-            media_type, target_dir = self._get_media_type_and_dir(media, title)
+            filename = self._get_filename(media, title, is_first_photo)
 
             # 下载文件
             downloaded_file = await event.message.download_media(file=TELEGRAM_TEMP_DIR)
-
             if not downloaded_file:
                 return False, "文件下载失败"
 
             # 构建目标路径
             target_path = os.path.join(target_dir, filename)
             
-            # 处理文件重名（除了fanart.jpg）
-            if filename != "fanart.jpg":
+            # 处理文件重名
+            if filename != "fanart.jpg":  # fanart.jpg允许覆盖
                 counter = 1
-                original_target_path = target_path
-                name, ext = os.path.splitext(original_target_path)
+                name, ext = os.path.splitext(target_path)
                 while os.path.exists(target_path):
                     target_path = f"{name}_{counter}{ext}"
                     counter += 1
@@ -226,15 +201,16 @@ class TelegramHandler:
             success, result = move_file(downloaded_file, target_path)
 
             if success:
-                logger.info(f"成功处理媒体文件: {title}/{filename}")
+                logger.info(f"成功处理文件: {title}/{filename}")
                 return True, {
-                    "type": media_type,
-                    "path": result,
-                    "filename": filename,
                     "title": title,
-                    "description": description,
+                    "filename": filename,
+                    "path": result,
                     "directory": target_dir,
-                    "message_id": message_id
+                    "is_video": hasattr(media, "document") and 
+                               hasattr(media.document, "mime_type") and 
+                               media.document.mime_type.startswith("video/"),
+                    "is_first_photo": is_first_photo
                 }
             else:
                 return False, f"移动文件失败: {result}"
@@ -242,8 +218,3 @@ class TelegramHandler:
         except Exception as e:
             logger.error(f"处理Telegram媒体文件时出错: {str(e)}")
             return False, str(e)
-
-    def cleanup_message_counter(self, message_id):
-        """清理消息计数器"""
-        if message_id in self.photo_counters:
-            del self.photo_counters[message_id]
