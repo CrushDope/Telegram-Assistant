@@ -1,6 +1,7 @@
 import re
 import logging
 import os
+import time
 from telethon import events
 from .telegram_handler import TelegramHandler
 from .youtube_handler import YouTubeHandler
@@ -305,23 +306,35 @@ class EventHandler:
     async def _handle_telegram_media(self, event):
         """处理Telegram媒体消息"""
         status_message = await event.reply("开始下载媒体文件...")
-        try:
-            success, result = await self.telegram_handler.process_media(event)
+        start_time = time.time()
 
+        try:
+            def progress_callback(percent):
+                elapsed = time.time() - start_time
+                msg = f"⏳ 下载中... {percent}%\n已用时: {elapsed:.1f} 秒"
+                # 更新进度消息
+                try:
+                    status_message.edit(msg)
+                except Exception:
+                    pass
+
+            success, result = await self.telegram_handler.process_media(
+                event, progress_callback
+            )
+
+            elapsed = time.time() - start_time
             if success:
-                elapsed = result.get("elapsed")
-                elapsed_str = f"{elapsed:.2f} 秒" if isinstance(elapsed, (int, float)) else "未知"
-                await event.reply(
-                    f"✅ {result.get('type', 'file')} 文件下载完成！\n"
-                    f"文件名: {result.get('filename')}\n"
-                    f"保存位置: {result.get('path')}\n"
-                    f"下载耗时: {elapsed_str}"
+                await status_message.edit(
+                    f"✅ {result['type']} 文件下载完成！\n"
+                    f"文件名: {result['filename']}\n"
+                    f"保存位置: {result['path']}\n"
+                    f"耗时: {elapsed:.1f} 秒"
                 )
                 # await self.send_video_to_user(event, result["path"])
             else:
-                await event.reply(f"❌ 下载失败: {result}")
+                await status_message.edit(f"❌ 下载失败: {result}")
         except Exception as e:
-            await event.reply(f"处理媒体文件时出错: {str(e)}")
+            await status_message.edit(f"处理媒体文件时出错: {str(e)}")
 
     async def handle_bilibili_message(self, message):
         """处理消息"""
