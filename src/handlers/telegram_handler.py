@@ -7,10 +7,10 @@ from ..utils.file_utils import move_file
 from ..constants import (
     TELEGRAM_TEMP_DIR,
     TELEGRAM_VIDEOS_DIR,
-    TELEGRAM_AUDIOS_DIR,   # 保留，不直接使用
-    TELEGRAM_PHOTOS_DIR,   # 保留，不直接使用
-    TELEGRAM_OTHERS_DIR,   # 保留，不直接使用
-    DOUYIN_DEST_DIR,       # 保留，不直接使用
+    TELEGRAM_AUDIOS_DIR,
+    TELEGRAM_PHOTOS_DIR,
+    TELEGRAM_OTHERS_DIR,
+    DOUYIN_DEST_DIR,
 )
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,10 @@ class TelegramHandler:
     def __init__(self, config):
         self.config = config
         self._ensure_directories()
+        # 分组标题缓存：确保同一相册/消息组的图片与视频使用同一标题与目录
+        # key: (chat_id, grouped_id or msg_id) -> {"title": str, "intro": str, "dir": str, "ts": float}
+        self._title_cache = {}
+        self._cache_limit = 512  # 简单的上限，超出就按时间清理
 
     def _ensure_directories(self):
         """确保所有必要的目录存在"""
@@ -33,11 +37,35 @@ class TelegramHandler:
         ]:
             os.makedirs(directory, exist_ok=True)
 
+    # -------------------- 工具方法 --------------------
+
+    def _cache_key(self, event):
+        """
+        优先使用 grouped_id 作为相册/分组 key；否则退回消息 id。
+        这样同一条相册中的每个媒体（视频+图片）都会命中同一个 key。
+        """
+        msg = event.message
+        grouped_id = getattr(msg, "grouped_id", None)
+        if grouped_id:
+            return (event.chat_id, f"group:{grouped_id}")
+        # 非相册：单条消息也给个唯一 key（便于后续可能的多段媒体延迟到达）
+        return (event.chat_id, f"msg:{msg.id}")
+
+    def _prune_cache(self):
+        """简单清理过期/过量缓存，避免内存增长"""
+        if len(self._title_cache) <= self._cache_limit:
+            return
+        # 按时间戳淘汰最早的
+        items = sorted(self._title_cache.items(), key=lambda kv: kv[1].get("ts", 0.0))
+        to_delete = len(items) - self._cache_limit
+        for i in range(to_delete):
+            del self._title_cache[items[i][0]]
+
     def _extract_title_and_intro(self, message_text: str):
         """
-        从消息文本中提取 标题 和 简介：
-        - 忽略【 前面的内容，只取 】后面的影视名字作为标题
-        - 简介为标题后的剩余文本（可多行）
+        提取 标题 和 简介：
+        - 标题：忽略【 前面的内容，只取 】后面的影视名字
+        - 简介：标题后的剩余文本
         """
         if not message_text or not message_text.strip():
             return None, None
@@ -47,17 +75,13 @@ class TelegramHandler:
         title, intro = None, None
 
         if match:
-            # 标题只取 】 后面的内容
             title = match.group(1).strip()
             title = re.sub(r'\s+', ' ', title)
             title = self._sanitize_filename(title)
-
-            # 简介：匹配段之后的剩余内容
             split_text = message_text.split(match.group(0), 1)
             if len(split_text) > 1:
                 intro = split_text[1].strip()
         else:
-            # 兜底：第一行作为标题，其余为简介
             lines = message_text.strip().split('\n', 1)
             title = self._sanitize_filename(lines[0].strip())
             if len(lines) > 1:
@@ -74,14 +98,13 @@ class TelegramHandler:
         return filename
 
     def _should_download_file(self, media):
-        """判断是否应该下载该文件：跳过以 photo_ 开头的文档文件"""
+        """判断是否应该下载该文件：跳过以 photo_ 开头的文档图片"""
         if hasattr(media, "document"):
             for attr in getattr(media.document, "attributes", []):
                 file_name = getattr(attr, "file_name", None)
                 if file_name and file_name.startswith('photo_'):
                     logger.info(f"跳过以photo_开头的文件: {file_name}")
                     return False
-        # 其余情况默认下载（photo 类型没有文件名，不作跳过）
         return True
 
     def _get_file_extension(self, media):
@@ -122,20 +145,17 @@ class TelegramHandler:
             return media.document.mime_type.startswith("image/")
         return False
 
-    def _get_file_type_str(self, media):
+    def _get_type_str(self, media):
         if self._is_video(media):
             return "video"
         if self._is_audio(media):
             return "audio"
         if self._is_image(media):
-            return "photo"
+            return "image"
         return "other"
 
     def _get_target_directory(self, title):
-        """
-        获取目标目录（基于标题创建子文件夹）
-        要求：视频和图片都放在以标题命名的子目录下
-        """
+        """视频与图片统一放在以标题命名的子目录"""
         target_dir = os.path.join(TELEGRAM_VIDEOS_DIR, title)
         os.makedirs(target_dir, exist_ok=True)
         return target_dir
@@ -150,44 +170,51 @@ class TelegramHandler:
         return None
 
     def _get_filename(self, media, title, is_first_photo=False):
-        """根据规则获取文件名"""
-        # 视频：使用标题命名
+        """命名规则：视频=标题；第一张图片=fanart.jpg；其余保留原名（无原名则时间戳）"""
         if self._is_video(media):
             ext = self._get_file_extension(media)
             return f"{title}{ext}"
 
-        # 图片（包括 photo 和 document 的 image/*）
         if self._is_image(media):
             if is_first_photo:
                 return "fanart.jpg"
-            # 非第一张：尽量保留原名（仅 document 有原名）
             original = self._get_original_filename_from_document(media)
             if original:
                 return original
-            # photo 没有原名，用时间戳兜底
             return f"image_{datetime.now().strftime('%H%M%S')}.jpg"
 
-        # 其他：时间戳 + 扩展名
         ext = self._get_file_extension(media)
         return f"file_{datetime.now().strftime('%H%M%S')}{ext}"
 
+    # -------------------- 主流程 --------------------
+
     async def process_media(self, event):
-        """处理Telegram媒体消息"""
+        """处理Telegram媒体消息：确保同一消息中的视频和图片落在同一子目录"""
         try:
             media = event.message.media
             if not media:
                 return False, "没有检测到媒体文件"
 
-            # 跳过不需要的文件
             if not self._should_download_file(media):
                 return False, "跳过以photo_开头的文件"
 
-            # 提取 标题 & 简介
+            # 计算/读取分组缓存
+            key = self._cache_key(event)
+            cached = self._title_cache.get(key)
+
             message_text = event.message.text or ""
-            title, intro = self._extract_title_and_intro(message_text)
-            if not title:
-                # 兜底：尝试从 document 获取
-                if hasattr(media, "document"):
+            title, intro = (None, None)
+
+            if cached:
+                title = cached["title"]
+                intro = cached.get("intro")
+                target_dir = cached["dir"]
+            else:
+                # 第一次遇到该分组：解析标题&简介
+                title, intro = self._extract_title_and_intro(message_text)
+
+                if not title:
+                    # 尝试从原文件名推断（通常视频/文档才有）
                     original = self._get_original_filename_from_document(media)
                     if original:
                         title = os.path.splitext(original)[0]
@@ -195,16 +222,23 @@ class TelegramHandler:
                     title = f"media_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 title = self._sanitize_filename(title)
 
-            # 创建目标目录
-            target_dir = self._get_target_directory(title)
+                target_dir = self._get_target_directory(title)
+                # 写入缓存
+                self._title_cache[key] = {
+                    "title": title,
+                    "intro": intro,
+                    "dir": target_dir,
+                    "ts": time.time(),
+                }
+                self._prune_cache()
 
-            # 判断是否是第一张图片 → fanart.jpg
+            # 第一张图片判断：以目录中是否已有 fanart.jpg 为准
             is_first_photo = False
             if self._is_image(media):
                 fanart_path = os.path.join(target_dir, "fanart.jpg")
                 is_first_photo = not os.path.exists(fanart_path)
 
-            # 获取文件名
+            # 生成文件名
             filename = self._get_filename(media, title, is_first_photo)
 
             # 下载并计时
@@ -214,32 +248,31 @@ class TelegramHandler:
             if not downloaded_file:
                 return False, "文件下载失败"
 
-            logger.info(f"文件下载完成: {filename}，耗时 {elapsed:.2f} 秒")
+            logger.info(f"文件下载完成: {filename}，下载耗时 {elapsed:.2f} 秒")
 
             # 目标路径 & 重名处理（fanart.jpg 允许覆盖）
             target_path = os.path.join(target_dir, filename)
             if filename != "fanart.jpg":
+                base, ext = os.path.splitext(target_path)
                 counter = 1
-                name, ext = os.path.splitext(target_path)
                 while os.path.exists(target_path):
-                    target_path = f"{name}_{counter}{ext}"
+                    target_path = f"{base}_{counter}{ext}"
                     counter += 1
 
-            # 移动文件到目标目录
+            # 移动文件
             success, result = move_file(downloaded_file, target_path)
-
             if success:
-                file_type = self._get_file_type_str(media)
+                ftype = self._get_type_str(media)
                 logger.info(f"成功处理文件: {title}/{os.path.basename(target_path)}")
                 return True, {
-                    "type": file_type,            # 'video' | 'photo' | 'audio' | 'other'
+                    "type": ftype,                 # 'video' | 'image' | 'audio' | 'other'
                     "title": title,
                     "intro": intro,
                     "filename": os.path.basename(target_path),
                     "path": result,
                     "directory": target_dir,
-                    "elapsed": elapsed,           # 下载耗时（秒）
-                    "is_first_photo": is_first_photo
+                    "elapsed": elapsed,
+                    "is_first_photo": is_first_photo,
                 }
             else:
                 return False, f"移动文件失败: {result}"
