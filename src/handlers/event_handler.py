@@ -174,8 +174,8 @@ class EventHandler:
                 is_youtube = bool(re.match(youtube_pattern, message_text))
                 is_douyin = bool(re.search(douyin_pattern, message_text))
                 is_bilibili = (
-                    "bilibili.com" in event.message.text
-                    or "b23.tv" in event.message.text
+                    "bilibili.com" in message_text
+                    or "b23.tv" in message_text
                 )
                 if is_youtube:
                     await self._handle_youtube_message(event)
@@ -309,10 +309,13 @@ class EventHandler:
             success, result = await self.telegram_handler.process_media(event)
 
             if success:
+                elapsed = result.get("elapsed")
+                elapsed_text = f"\n下载耗时: {elapsed:.2f} 秒" if elapsed is not None else ""
                 await event.reply(
                     f"✅ {result['type']} 文件下载完成！\n"
                     f"文件名: {result['filename']}\n"
                     f"保存位置: {result['path']}"
+                    f"{elapsed_text}"
                 )
                 # await self.send_video_to_user(event, result["path"])
             else:
