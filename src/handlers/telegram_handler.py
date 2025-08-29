@@ -182,6 +182,14 @@ class TelegramHandler:
         try:
             logger.info(f"开始处理媒体组 {group_id}, 包含 {len(media_files)} 个文件")
             
+            # 统计文件信息
+            total_files = len(media_files)
+            photo_count = sum(1 for f in media_files if f['type'] == 'photo')
+            video_count = sum(1 for f in media_files if f['type'] == 'video')
+            other_count = total_files - photo_count - video_count
+            
+            logger.info(f"媒体组 {group_id} 统计: {total_files}个文件, {photo_count}张图片, {video_count}个视频, {other_count}个其他文件")
+            
             # 从标题中提取目录名
             directory_name = self._extract_title(caption)
             
@@ -189,14 +197,15 @@ class TelegramHandler:
             group_dir = os.path.join(TELEGRAM_VIDEOS_DIR, directory_name)
             os.makedirs(group_dir, exist_ok=True)
             
-            # 分离图片和视频
+            # 分离图片、视频和其他文件
             photos = [f for f in media_files if f['type'] == 'photo']
             videos = [f for f in media_files if f['type'] == 'video']
+            others = [f for f in media_files if f['type'] == 'other']
             
             # 处理图片命名
+            photo_renames = {}
             for i, photo in enumerate(photos):
                 temp_path = photo['temp_path']
-                original_ext = os.path.splitext(photo['original_filename'])[1]
                 
                 if i == 0:  # 第一张图片命名为fanart.jpg
                     new_filename = "fanart.jpg"
@@ -207,9 +216,11 @@ class TelegramHandler:
                 
                 # 移动文件
                 shutil.move(temp_path, target_path)
+                photo_renames[photo['original_filename']] = new_filename
                 logger.info(f"图片重命名: {photo['original_filename']} -> {new_filename}")
             
             # 处理视频命名（保持原有名称）
+            video_names = {}
             for video in videos:
                 temp_path = video['temp_path']
                 original_filename = video['original_filename']
@@ -218,20 +229,46 @@ class TelegramHandler:
                 
                 # 移动文件
                 shutil.move(temp_path, target_path)
+                video_names[original_filename] = original_filename
                 logger.info(f"视频保持原名: {original_filename}")
             
-            # 统计信息
-            photo_count = len(photos)
-            video_count = len(videos)
+            # 处理其他文件
+            other_names = {}
+            for other in others:
+                temp_path = other['temp_path']
+                original_filename = other['original_filename']
+                
+                target_path = os.path.join(group_dir, original_filename)
+                
+                # 移动文件
+                shutil.move(temp_path, target_path)
+                other_names[original_filename] = original_filename
+                logger.info(f"其他文件保持原名: {original_filename}")
             
+            # 构建详细的统计信息
             group_info = {
                 'group_id': group_id,
                 'caption': caption,
                 'directory': group_dir,
+                'directory_name': directory_name,
+                'total_files': total_files,
                 'photo_count': photo_count,
                 'video_count': video_count,
-                'total_files': len(media_files),
-                'processed_at': datetime.now().isoformat()
+                'other_count': other_count,
+                'photo_renames': photo_renames,
+                'video_names': list(video_names.keys()),
+                'other_names': list(other_names.keys()),
+                'processed_at': datetime.now().isoformat(),
+                'file_list': [
+                    {
+                        'original_name': f['original_filename'],
+                        'final_name': photo_renames.get(f['original_filename'], 
+                                      video_names.get(f['original_filename'], 
+                                      other_names.get(f['original_filename'], f['original_filename']))),
+                        'type': f['type']
+                    }
+                    for f in media_files
+                ]
             }
             
             logger.info(f"媒体组 {group_id} 处理完成: {group_info}")
