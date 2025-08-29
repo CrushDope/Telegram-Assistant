@@ -219,20 +219,30 @@ class TelegramHandler:
                 photo_renames[photo['original_filename']] = new_filename
                 logger.info(f"图片重命名: {photo['original_filename']} -> {new_filename}")
             
-            # 处理视频命名（保持原有名称）
+            # 处理视频命名（使用提取的标题）
             video_names = {}
-            for video in videos:
+            for i, video in enumerate(videos):
                 temp_path = video['temp_path']
-                original_filename = video['original_filename']
+                original_ext = os.path.splitext(video['original_filename'])[1]
                 
-                target_path = os.path.join(group_dir, original_filename)
+                if video_count == 1:
+                    # 如果只有一个视频，直接使用目录名
+                    new_filename = f"{directory_name}{original_ext}"
+                else:
+                    # 如果有多个视频，添加序号
+                    new_filename = f"{directory_name}_{i+1}{original_ext}"
+                
+                # 清理文件名中的非法字符
+                new_filename = self._sanitize_filename(new_filename)
+                
+                target_path = os.path.join(group_dir, new_filename)
                 
                 # 移动文件
                 shutil.move(temp_path, target_path)
-                video_names[original_filename] = original_filename
-                logger.info(f"视频保持原名: {original_filename}")
+                video_names[video['original_filename']] = new_filename
+                logger.info(f"视频重命名: {video['original_filename']} -> {new_filename}")
             
-            # 处理其他文件
+            # 处理其他文件（保持原有名称）
             other_names = {}
             for other in others:
                 temp_path = other['temp_path']
@@ -256,7 +266,7 @@ class TelegramHandler:
                 'video_count': video_count,
                 'other_count': other_count,
                 'photo_renames': photo_renames,
-                'video_names': list(video_names.keys()),
+                'video_names': list(video_names.values()),
                 'other_names': list(other_names.keys()),
                 'processed_at': datetime.now().isoformat(),
                 'file_list': [
