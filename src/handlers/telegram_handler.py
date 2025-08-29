@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import shutil
 from datetime import datetime
 from ..utils.file_utils import move_file
 from ..constants import (
@@ -32,10 +33,22 @@ class TelegramHandler:
         ]:
             os.makedirs(directory, exist_ok=True)
 
+    def _sanitize_filename(self, filename):
+        """清理文件名中的非法字符"""
+        # 移除Windows和Linux中的非法文件名字符
+        illegal_chars = r'[<>:"/\\|?*\x00-\x1f]'
+        filename = re.sub(illegal_chars, '', filename)
+        # 移除开头和结尾的点号和空格
+        filename = filename.strip('. ')
+        # 限制文件名长度
+        if len(filename) > 200:
+            filename = filename[:200]
+        return filename
+
     def _extract_title(self, message_text):
         """从消息文本中提取标题"""
         if not message_text:
-            return ""
+            return "无标题媒体组"
             
         # 尝试匹配【】中的内容
         pattern = r"【(.*?)】"
@@ -63,7 +76,7 @@ class TelegramHandler:
                 title = f"【{title_part}】"
             
             # 清理标题中的非法文件名字符
-            title = re.sub(r'[<>:"/\\|?*]', '', title)
+            title = self._sanitize_filename(title)
             return title
         
         # 如果没有找到【】格式的标题，返回原始文本的第一行（直到换行符）
@@ -71,9 +84,9 @@ class TelegramHandler:
         # 移除可能的标签部分（以#开头的内容）
         first_line = re.sub(r'#.*$', '', first_line).strip()
         # 清理非法字符
-        first_line = re.sub(r'[<>:"/\\|?*]', '', first_line)
+        first_line = self._sanitize_filename(first_line)
         
-        return first_line if first_line else ""
+        return first_line if first_line else "无标题媒体组"
 
     def _get_media_type_and_dir(self, media):
         """确定媒体类型和目标目录"""
@@ -162,4 +175,75 @@ class TelegramHandler:
 
         except Exception as e:
             logger.error(f"处理Telegram媒体文件时出错: {str(e)}")
+            return False, str(e)
+
+    async def process_media_group(self, group_id, media_files, caption):
+        """处理媒体组文件"""
+        try:
+            logger.info(f"开始处理媒体组 {group_id}, 包含 {len(media_files)} 个文件")
+            
+            # 从标题中提取目录名
+            directory_name = self._extract_title(caption)
+            
+            # 创建媒体组专属目录（在TELEGRAM_VIDEOS_DIR下）
+            group_dir = os.path.join(TELEGRAM_VIDEOS_DIR, directory_name)
+            os.makedirs(group_dir, exist_ok=True)
+            
+            # 分离图片和视频
+            photos = [f for f in media_files if f['type'] == 'photo']
+            videos = [f for f in media_files if f['type'] == 'video']
+            
+            # 处理图片命名
+            for i, photo in enumerate(photos):
+                temp_path = photo['temp_path']
+                original_ext = os.path.splitext(photo['original_filename'])[1]
+                
+                if i == 0:  # 第一张图片命名为fanart.jpg
+                    new_filename = "fanart.jpg"
+                else:  # 其他图片命名为snapshot.jpg
+                    new_filename = f"snapshot{i}.jpg"
+                
+                target_path = os.path.join(group_dir, new_filename)
+                
+                # 移动文件
+                shutil.move(temp_path, target_path)
+                logger.info(f"图片重命名: {photo['original_filename']} -> {new_filename}")
+            
+            # 处理视频命名（保持原有名称）
+            for video in videos:
+                temp_path = video['temp_path']
+                original_filename = video['original_filename']
+                
+                target_path = os.path.join(group_dir, original_filename)
+                
+                # 移动文件
+                shutil.move(temp_path, target_path)
+                logger.info(f"视频保持原名: {original_filename}")
+            
+            # 统计信息
+            photo_count = len(photos)
+            video_count = len(videos)
+            
+            group_info = {
+                'group_id': group_id,
+                'caption': caption,
+                'directory': group_dir,
+                'photo_count': photo_count,
+                'video_count': video_count,
+                'total_files': len(media_files),
+                'processed_at': datetime.now().isoformat()
+            }
+            
+            logger.info(f"媒体组 {group_id} 处理完成: {group_info}")
+            return True, group_info
+            
+        except Exception as e:
+            logger.error(f"处理媒体组时出错: {str(e)}")
+            # 清理临时文件
+            for media_file in media_files:
+                if os.path.exists(media_file['temp_path']):
+                    try:
+                        os.remove(media_file['temp_path'])
+                    except:
+                        pass
             return False, str(e)
