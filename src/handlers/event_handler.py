@@ -1,7 +1,10 @@
 import re
 import logging
 import os
+import asyncio
+from collections import defaultdict
 from telethon import events
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 from .telegram_handler import TelegramHandler
 from .youtube_handler import YouTubeHandler
 from .douyin_handler import CustomDouyinHandler
@@ -31,6 +34,11 @@ class EventHandler:
         )
         if not os.path.exists(self.temp_dir):
             os.makedirs(self.temp_dir)
+
+        # 媒体组处理相关
+        self.media_groups = defaultdict(list)
+        self.group_tasks = {}
+        self.media_group_delay = config.get("media_group_delay", 3.0)  # 媒体组等待时间
 
     async def send_video_to_user(self, event, file_path):
         """统一的发送文件方法"""
@@ -166,6 +174,11 @@ class EventHandler:
                 # 先检查是否需要转发消息
                 await self._handle_message_transfer(event)
 
+                # 检查是否是媒体组消息
+                if event.message.grouped_id:
+                    await self._handle_media_group(event)
+                    return
+
                 message_text = event.message.text if event.message.text else ""
 
                 # 检查是否是YouTube链接
@@ -190,9 +203,97 @@ class EventHandler:
                 logger.error(f"处理消息时出错: {str(e)}")
                 await event.reply(f"处理消息时出错: {str(e)}")
 
+    async def _handle_media_group(self, event):
+        """处理媒体组（相册）消息"""
+        try:
+            group_id = event.message.grouped_id
+            logger.info(f"收到媒体组消息，组ID: {group_id}")
+
+            # 添加消息到媒体组
+            self.media_groups[group_id].append(event.message)
+
+            # 如果这个组还没有处理任务，创建一个延迟任务
+            if group_id not in self.group_tasks:
+                self.group_tasks[group_id] = asyncio.create_task(
+                    self._process_media_group_with_delay(group_id)
+                )
+
+            await event.reply(f"📸 检测到媒体组消息，正在等待所有媒体到达...")
+
+        except Exception as e:
+            logger.error(f"处理媒体组消息时出错: {str(e)}")
+            await event.reply(f"处理媒体组时出错: {str(e)}")
+
+    async def _process_media_group_with_delay(self, group_id):
+        """等待一段时间后处理完整的媒体组"""
+        try:
+            # 等待指定时间，确保所有媒体消息都到达
+            await asyncio.sleep(self.media_group_delay)
+
+            messages = self.media_groups.get(group_id, [])
+            if not messages:
+                return
+
+            # 获取第一条消息的文字作为整个媒体组的标题
+            caption = messages[0].text or "无标题媒体组"
+            chat_id = messages[0].chat_id
+
+            logger.info(f"开始处理媒体组 {group_id}, 包含 {len(messages)} 个媒体")
+
+            # 下载所有媒体文件到临时目录
+            downloaded_files = []
+            for i, message in enumerate(messages):
+                if message.media:
+                    try:
+                        # 下载媒体文件到临时目录
+                        temp_file_path = await message.download_media(file=self.temp_dir)
+                        
+                        # 获取原始文件名
+                        original_filename = os.path.basename(temp_file_path)
+                        
+                        downloaded_files.append({
+                            'temp_path': temp_file_path,
+                            'original_filename': original_filename,
+                            'type': 'photo' if isinstance(message.media, MessageMediaPhoto) else 'video',
+                            'message_id': message.id,
+                            'index': i
+                        })
+                        logger.info(f"媒体组文件下载成功: {temp_file_path}")
+                    except Exception as e:
+                        logger.error(f"下载媒体组文件时出错: {str(e)}")
+
+            # 处理媒体组文件
+            if downloaded_files:
+                success, result = await self.telegram_handler.process_media_group(
+                    group_id, downloaded_files, caption
+                )
+                
+                if success:
+                    logger.info(f"媒体组 {group_id} 处理完成: {result}")
+                else:
+                    logger.error(f"媒体组 {group_id} 处理失败: {result}")
+
+            # 清理
+            if group_id in self.media_groups:
+                del self.media_groups[group_id]
+            if group_id in self.group_tasks:
+                del self.group_tasks[group_id]
+
+        except Exception as e:
+            logger.error(f"处理媒体组延迟任务时出错: {str(e)}")
+            # 清理出错的组
+            if group_id in self.media_groups:
+                del self.media_groups[group_id]
+            if group_tasks.get(group_id):
+                del self.group_tasks[group_id]
+
     async def _handle_message_transfer(self, event):
         """处理消息转发（适用于机器人客户端）"""
         if not self.transfer_config:
+            return
+
+        # 跳过媒体组消息的转发，避免重复处理
+        if event.message.grouped_id:
             return
 
         # 获取当前聊天的ID
@@ -263,7 +364,6 @@ class EventHandler:
                         f"标题: {video.get('desc')}\n"
                         f"保存位置: {video.get('dest_path')}"
                     )
-                    # await self.send_video_to_user(event, video.get("dest_path"))
                 else:
                     await event.reply("无法下载该抖音视频，请检查链接是否有效。")
             else:
@@ -289,7 +389,6 @@ class EventHandler:
                 await event.reply(
                     f"✅ YouTube{file_type}下载完成！\n" f"保存位置: {result}"
                 )
-                # await self.send_video_to_user(event, result)
             else:
                 await event.reply(f"❌ YouTube视频下载失败！\n" f"错误: {result}")
         except Exception as e:
@@ -314,14 +413,13 @@ class EventHandler:
                     f"文件名: {result['filename']}\n"
                     f"保存位置: {result['path']}"
                 )
-                # await self.send_video_to_user(event, result["path"])
             else:
                 await event.reply(f"❌ 下载失败: {result}")
         except Exception as e:
             await event.reply(f"处理媒体文件时出错: {str(e)}")
 
     async def handle_bilibili_message(self, message):
-        """处理消息"""
+        """处理B站消息"""
         try:
             await message.reply("正在下载B站视频，请稍候...")
             url = re.findall(
@@ -335,7 +433,6 @@ class EventHandler:
                         f"标题: {video.get('title')}\n"
                         f"保存位置: {video.get('path')}"
                     )
-                    # await self.send_video_to_user(message, video.get("path"))
                     return True
             else:
                 await message.reply("下载B站视频失败,请检查链接是否有效")
