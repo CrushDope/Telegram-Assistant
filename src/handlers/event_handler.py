@@ -251,27 +251,70 @@ class EventHandler:
                         # 获取原始文件名
                         original_filename = os.path.basename(temp_file_path)
                         
+                        # 确定媒体类型
+                        if isinstance(message.media, MessageMediaPhoto):
+                            media_type = 'photo'
+                        elif isinstance(message.media, MessageMediaDocument):
+                            # 检查是否是视频
+                            document = message.media.document
+                            if hasattr(document, 'mime_type') and document.mime_type.startswith('video/'):
+                                media_type = 'video'
+                            else:
+                                media_type = 'other'
+                        else:
+                            media_type = 'other'
+                        
                         downloaded_files.append({
                             'temp_path': temp_file_path,
                             'original_filename': original_filename,
-                            'type': 'photo' if isinstance(message.media, MessageMediaPhoto) else 'video',
+                            'type': media_type,
                             'message_id': message.id,
                             'index': i
                         })
-                        logger.info(f"媒体组文件下载成功: {temp_file_path}")
+                        logger.info(f"媒体组文件下载成功: {temp_file_path} (类型: {media_type})")
                     except Exception as e:
                         logger.error(f"下载媒体组文件时出错: {str(e)}")
 
             # 处理媒体组文件
             if downloaded_files:
+                # 统计文件信息
+                total_files = len(downloaded_files)
+                photo_count = sum(1 for f in downloaded_files if f['type'] == 'photo')
+                video_count = sum(1 for f in downloaded_files if f['type'] == 'video')
+                other_count = total_files - photo_count - video_count
+                
+                logger.info(f"媒体组 {group_id} 统计: {total_files}个文件, {photo_count}张图片, {video_count}个视频, {other_count}个其他文件")
+                
                 success, result = await self.telegram_handler.process_media_group(
                     group_id, downloaded_files, caption
                 )
                 
                 if success:
-                    logger.info(f"媒体组 {group_id} 处理完成: {result}")
+                    # 发送处理完成的通知
+                    first_message = messages[0]
+                    try:
+                        summary_msg = (
+                            f"✅ 媒体组处理完成！\n"
+                            f"📁 目录: {os.path.basename(result['directory'])}\n"
+                            f"📊 统计: {total_files}个文件\n"
+                            f"🖼️ 图片: {photo_count}张\n"
+                            f"🎬 视频: {video_count}个"
+                        )
+                        if other_count > 0:
+                            summary_msg += f"\n📎 其他: {other_count}个"
+                        
+                        await first_message.reply(summary_msg)
+                        logger.info(f"媒体组 {group_id} 处理完成: {result}")
+                    except Exception as e:
+                        logger.error(f"发送媒体组完成通知时出错: {str(e)}")
                 else:
                     logger.error(f"媒体组 {group_id} 处理失败: {result}")
+                    # 发送失败通知
+                    first_message = messages[0]
+                    try:
+                        await first_message.reply(f"❌ 媒体组处理失败: {result}")
+                    except Exception as e:
+                        logger.error(f"发送媒体组失败通知时出错: {str(e)}")
 
             # 清理
             if group_id in self.media_groups:
@@ -284,8 +327,15 @@ class EventHandler:
             # 清理出错的组
             if group_id in self.media_groups:
                 del self.media_groups[group_id]
-            if group_tasks.get(group_id):
+            if group_id in self.group_tasks:
                 del self.group_tasks[group_id]
+            
+            # 尝试发送错误通知
+            try:
+                if messages and len(messages) > 0:
+                    await messages[0].reply(f"❌ 处理媒体组时发生错误: {str(e)}")
+            except:
+                pass
 
     async def _handle_message_transfer(self, event):
         """处理消息转发（适用于机器人客户端）"""
