@@ -46,7 +46,7 @@ class TelegramHandler:
         return filename
 
     def _extract_title(self, message_text):
-        """从消息文本中提取标题（用于目录名）"""
+        """从消息文本中提取标题"""
         if not message_text:
             return "无标题媒体组"
             
@@ -88,53 +88,6 @@ class TelegramHandler:
         
         return first_line if first_line else "无标题媒体组"
 
-    def _extract_english_title(self, message_text):
-        """从消息文本中提取英文标题（用于视频文件名）"""
-        if not message_text:
-            return "untitled"
-            
-        # 首先尝试匹配英文标题模式（大写字母、空格、逗号等）
-        english_pattern = r'[A-Z][A-Za-z\s,\'-]+(?:\s+[A-Z][A-Za-z\s,\'-]+)*'
-        english_matches = re.findall(english_pattern, message_text)
-        
-        # 过滤掉太短的匹配项（至少3个字符）
-        english_matches = [match.strip() for match in english_matches if len(match.strip()) >= 3]
-        
-        if english_matches:
-            # 优先选择较长的英文标题
-            english_matches.sort(key=len, reverse=True)
-            english_title = english_matches[0]
-            
-            # 清理标题中的非法文件名字符
-            english_title = self._sanitize_filename(english_title)
-            return english_title
-        
-        # 如果没有找到英文标题，尝试提取【】后面的内容
-        pattern = r"【.*?】\s*([^\n#]*)"
-        match = re.search(pattern, message_text)
-        if match:
-            rest_text = match.group(1).strip()
-            if rest_text:
-                # 清理并返回
-                rest_text = self._sanitize_filename(rest_text)
-                return rest_text
-        
-        # 最后尝试提取第一行非中文内容
-        lines = message_text.split('\n')
-        for line in lines:
-            line = line.strip()
-            # 跳过空行和纯中文行
-            if line and re.search(r'[a-zA-Z]', line):
-                # 移除#标签和特殊字符
-                line = re.sub(r'#\w+', '', line)
-                line = re.sub(r'[^\w\s\-.,]', '', line)
-                line = line.strip()
-                if line:
-                    line = self._sanitize_filename(line)
-                    return line
-        
-        return "untitled"
-
     def _get_media_type_and_dir(self, media):
         """确定媒体类型和目标目录"""
         if hasattr(media, "document"):
@@ -167,8 +120,8 @@ class TelegramHandler:
             return f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
 
         # 从消息文本中提取标题作为文件名
-        title = self._extract_english_title(message_text)
-        if title and title != "untitled":
+        title = self._extract_title(message_text)
+        if title:
             return title
             
         return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -186,11 +139,11 @@ class TelegramHandler:
             # 获取文件名
             filename = self._get_filename(media, event.message.message)
             
-            # 如果文件名是时间戳格式或者不包含字母，但消息文本中有内容，使用提取的标题
-            if (not re.search("[a-zA-Z]", filename) or 
-                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}" in filename) and event.message.message:
-                extracted_title = self._extract_english_title(event.message.message)
-                if extracted_title and extracted_title != "untitled":
+            # 如果文件名是时间戳格式或者不包含中文，但消息文本中有中文，使用提取的标题
+            if (not re.search("[\u4e00-\u9fff]+", filename) or 
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}" in filename) and re.search(r"[\u4e00-\u9fff]+", event.message.message):
+                extracted_title = self._extract_title(event.message.message)
+                if extracted_title:
                     filename = extracted_title
 
             # 下载文件
@@ -237,11 +190,8 @@ class TelegramHandler:
             
             logger.info(f"媒体组 {group_id} 统计: {total_files}个文件, {photo_count}张图片, {video_count}个视频, {other_count}个其他文件")
             
-            # 从标题中提取目录名（完整标题）
+            # 从标题中提取目录名
             directory_name = self._extract_title(caption)
-            
-            # 提取英文标题（用于视频文件名）
-            english_title = self._extract_english_title(caption)
             
             # 创建媒体组专属目录（在TELEGRAM_VIDEOS_DIR下）
             group_dir = os.path.join(TELEGRAM_VIDEOS_DIR, directory_name)
@@ -269,18 +219,18 @@ class TelegramHandler:
                 photo_renames[photo['original_filename']] = new_filename
                 logger.info(f"图片重命名: {photo['original_filename']} -> {new_filename}")
             
-            # 处理视频命名（使用英文标题）
+            # 处理视频命名（使用提取的标题）
             video_names = {}
             for i, video in enumerate(videos):
                 temp_path = video['temp_path']
                 original_ext = os.path.splitext(video['original_filename'])[1]
                 
                 if video_count == 1:
-                    # 如果只有一个视频，直接使用英文标题
-                    new_filename = f"{english_title}{original_ext}"
+                    # 如果只有一个视频，直接使用目录名
+                    new_filename = f"{directory_name}{original_ext}"
                 else:
                     # 如果有多个视频，添加序号
-                    new_filename = f"{english_title}_{i+1}{original_ext}"
+                    new_filename = f"{directory_name}_{i+1}{original_ext}"
                 
                 # 清理文件名中的非法字符
                 new_filename = self._sanitize_filename(new_filename)
@@ -311,7 +261,6 @@ class TelegramHandler:
                 'caption': caption,
                 'directory': group_dir,
                 'directory_name': directory_name,
-                'english_title': english_title,
                 'total_files': total_files,
                 'photo_count': photo_count,
                 'video_count': video_count,
