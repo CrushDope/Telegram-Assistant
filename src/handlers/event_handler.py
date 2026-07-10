@@ -5,6 +5,7 @@ from collections import defaultdict
 from telethon import events
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 from .telegram_handler import TelegramHandler
+from ..constants import TELEGRAM_TEMP_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -14,13 +15,6 @@ class EventHandler:
         self.config = config
         self.telegram_handler = TelegramHandler(config)
         self.send_file = config.get("send_file", False)
-
-        self.temp_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "temp",
-        )
-        if not os.path.exists(self.temp_dir):
-            os.makedirs(self.temp_dir)
 
         self.media_groups = defaultdict(list)
         self.group_tasks = {}
@@ -258,9 +252,9 @@ class EventHandler:
         async def download_one(index, msg):
             try:
                 if client:
-                    path = await client.download_media(msg, file=self.temp_dir)
+                    path = await client.download_media(msg, file=TELEGRAM_TEMP_DIR)
                 else:
-                    path = await msg.download_media(file=self.temp_dir)
+                    path = await msg.download_media(file=TELEGRAM_TEMP_DIR)
 
                 if not path:
                     logger.warning(f"[_download_messages_concurrently] {tag} msg={msg.id} 返回 None，跳过")
