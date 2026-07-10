@@ -102,33 +102,7 @@ class EventHandler:
             caption = messages[0].text or "无标题媒体组"
             logger.info(f"[_process_media_group_with_delay] group={group_id} 共 {len(messages)} 条消息，caption='{caption[:50]}'")
 
-            downloaded_files = []
-            for i, message in enumerate(messages):
-                if not message.media:
-                    logger.debug(f"[_process_media_group_with_delay] group={group_id} msg={message.id} 无媒体，跳过")
-                    continue
-                try:
-                    logger.info(f"[_process_media_group_with_delay] group={group_id} 下载第 {i+1}/{len(messages)} 条 msg={message.id}")
-                    temp_file_path = await message.download_media(file=self.temp_dir)
-
-                    if isinstance(message.media, MessageMediaPhoto):
-                        media_type = "photo"
-                    elif isinstance(message.media, MessageMediaDocument):
-                        doc = message.media.document
-                        media_type = "video" if (hasattr(doc, "mime_type") and doc.mime_type.startswith("video/")) else "other"
-                    else:
-                        media_type = "other"
-
-                    downloaded_files.append({
-                        "temp_path": temp_file_path,
-                        "original_filename": os.path.basename(temp_file_path),
-                        "type": media_type,
-                        "message_id": message.id,
-                        "index": i,
-                    })
-                    logger.info(f"[_process_media_group_with_delay] group={group_id} msg={message.id} 下载成功: {temp_file_path} 类型={media_type}")
-                except Exception as e:
-                    logger.error(f"[_process_media_group_with_delay] group={group_id} msg={message.id} 下载失败: {e}")
+            downloaded_files = await self._download_messages_concurrently(messages, tag=f"group={group_id}")
 
             if not downloaded_files:
                 logger.error(f"[_process_media_group_with_delay] group={group_id} 所有文件下载失败")
@@ -234,35 +208,7 @@ class EventHandler:
 
         await event.reply(f"🔍 检测到原始消息包含 {len(album_messages)} 个文件，开始下载完整媒体组...")
 
-        downloaded_files = []
-        for i, msg in enumerate(album_messages):
-            if not msg.media:
-                continue
-            try:
-                logger.info(f"[_handle_forwarded_media] 下载第 {i+1}/{len(album_messages)} 条 msg={msg.id}")
-                temp_file_path = await self.user_client.download_media(msg, file=self.temp_dir)
-                if not temp_file_path:
-                    logger.warning(f"[_handle_forwarded_media] msg={msg.id} download_media 返回 None，跳过")
-                    continue
-
-                if isinstance(msg.media, MessageMediaPhoto):
-                    media_type = "photo"
-                elif isinstance(msg.media, MessageMediaDocument):
-                    doc = msg.media.document
-                    media_type = "video" if (hasattr(doc, "mime_type") and doc.mime_type.startswith("video/")) else "other"
-                else:
-                    media_type = "other"
-
-                downloaded_files.append({
-                    "temp_path": temp_file_path,
-                    "original_filename": os.path.basename(temp_file_path),
-                    "type": media_type,
-                    "message_id": msg.id,
-                    "index": i,
-                })
-                logger.info(f"[_handle_forwarded_media] msg={msg.id} 下载成功: {temp_file_path} 类型={media_type}")
-            except Exception as e:
-                logger.error(f"[_handle_forwarded_media] msg={msg.id} 下载失败: {e}")
+        downloaded_files = await self._download_messages_concurrently(album_messages, client=self.user_client, tag=f"fwd_msg={msg_id}")
 
         if not downloaded_files:
             logger.error(f"[_handle_forwarded_media] 所有文件下载失败")
@@ -297,6 +243,60 @@ class EventHandler:
             await event.reply(f"❌ 媒体组处理失败: {result}")
 
         return True
+
+    async def _download_messages_concurrently(self, messages, client=None, tag=""):
+        """
+        并发下载消息列表中的所有媒体文件。
+        client 为 None 时每条消息用自身的 download_media（bot client 路径）。
+        """
+        media_messages = [(i, msg) for i, msg in enumerate(messages) if msg.media]
+        if not media_messages:
+            return []
+
+        logger.info(f"[_download_messages_concurrently] {tag} 并发下载 {len(media_messages)} 个文件")
+
+        async def download_one(index, msg):
+            try:
+                if client:
+                    path = await client.download_media(msg, file=self.temp_dir)
+                else:
+                    path = await msg.download_media(file=self.temp_dir)
+
+                if not path:
+                    logger.warning(f"[_download_messages_concurrently] {tag} msg={msg.id} 返回 None，跳过")
+                    return None
+
+                if isinstance(msg.media, MessageMediaPhoto):
+                    media_type = "photo"
+                elif isinstance(msg.media, MessageMediaDocument):
+                    doc = msg.media.document
+                    media_type = "video" if (hasattr(doc, "mime_type") and doc.mime_type.startswith("video/")) else "other"
+                else:
+                    media_type = "other"
+
+                logger.info(f"[_download_messages_concurrently] {tag} msg={msg.id} 下载完成: {path} 类型={media_type}")
+                return {
+                    "temp_path": path,
+                    "original_filename": os.path.basename(path),
+                    "type": media_type,
+                    "message_id": msg.id,
+                    "index": index,
+                }
+            except Exception as e:
+                logger.error(f"[_download_messages_concurrently] {tag} msg={msg.id} 下载失败: {e}")
+                return None
+
+        results = await asyncio.gather(*(download_one(i, msg) for i, msg in media_messages))
+
+        downloaded = [r for r in results if r is not None]
+        # 保持原始消息顺序
+        downloaded.sort(key=lambda f: f["index"])
+
+        failed = len(media_messages) - len(downloaded)
+        if failed:
+            logger.warning(f"[_download_messages_concurrently] {tag} {failed} 个文件下载失败")
+        logger.info(f"[_download_messages_concurrently] {tag} 完成: {len(downloaded)}/{len(media_messages)} 个文件下载成功")
+        return downloaded
 
     async def _fetch_original_album(self, chat, msg_id):
         """从原始来源获取完整媒体组"""
