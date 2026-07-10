@@ -3,9 +3,13 @@ import os
 import asyncio
 from collections import defaultdict
 from telethon import events
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+from telethon.tl.types import (
+    MessageMediaPhoto, MessageMediaDocument,
+    PeerChannel, PeerChat, PeerUser,
+)
 from .telegram_handler import TelegramHandler
 from ..constants import TELEGRAM_TEMP_DIR
+from ..services.task_queue import TaskQueue, TASK_SINGLE, TASK_FORWARDED
 
 logger = logging.getLogger(__name__)
 
@@ -20,14 +24,17 @@ class EventHandler:
         self.group_tasks = {}
         self.media_group_delay = config.get("media_group_delay", 3.0)
         self.user_client = None
+        self.bot_client = None
 
-        # 同时进行的下载任务上限，避免多任务并发时 Telethon 连接互相竞争
         max_concurrent = config.get("max_concurrent_downloads", 2)
         self._download_semaphore = asyncio.Semaphore(max_concurrent)
         logger.info(f"[EventHandler] 最大并发下载数: {max_concurrent}")
 
+        self.task_queue = TaskQueue()
+
     def register_handlers(self, client, user_client=None):
         """注册所有事件处理器"""
+        self.bot_client = client
         self.user_client = user_client
         if user_client:
             logger.info("[EventHandler] user client 已启用，支持原始媒体组拉取")
@@ -50,13 +57,22 @@ class EventHandler:
                     return
 
                 if event.message.media and event.message.fwd_from:
-                    logger.info(f"[handle_message] chat={chat_id} msg={msg_id} 检测到转发媒体消息，创建独立任务")
-                    asyncio.create_task(self._handle_forwarded_media_task(event))
+                    fwd = event.message.fwd_from
+                    if fwd and fwd.from_id and fwd.channel_post:
+                        peer_id, peer_type = self._extract_peer(fwd.from_id)
+                        task_id = self.task_queue.add_forwarded(
+                            chat_id, msg_id, peer_id, peer_type, fwd.channel_post
+                        )
+                    else:
+                        task_id = self.task_queue.add_single(chat_id, msg_id)
+                    logger.info(f"[handle_message] chat={chat_id} msg={msg_id} 转发媒体任务入队 task_id={task_id}")
+                    asyncio.create_task(self._run_task(task_id, event=event))
                     return
 
                 if event.message.media:
-                    logger.info(f"[handle_message] chat={chat_id} msg={msg_id} 处理单条媒体消息，创建独立任务")
-                    asyncio.create_task(self._handle_telegram_media_task(event))
+                    task_id = self.task_queue.add_single(chat_id, msg_id)
+                    logger.info(f"[handle_message] chat={chat_id} msg={msg_id} 单文件任务入队 task_id={task_id}")
+                    asyncio.create_task(self._run_task(task_id, event=event))
                 else:
                     logger.debug(f"[handle_message] chat={chat_id} msg={msg_id} 无媒体内容，忽略")
 
@@ -64,8 +80,154 @@ class EventHandler:
                 logger.exception(f"[handle_message] chat={chat_id} msg={msg_id} 处理异常: {e}")
                 await event.reply(f"处理消息时出错: {str(e)}")
 
+    # ------------------------------------------------------------------
+    # 任务执行入口
+    # ------------------------------------------------------------------
+
+    async def _run_task(self, task_id: str, event=None, is_resume: bool = False):
+        """统一任务执行入口，支持新任务和重启恢复"""
+        task = self.task_queue.get(task_id)
+        if not task:
+            logger.error(f"[_run_task] task_id={task_id} 不存在")
+            return
+
+        chat_id = task["chat_id"]
+        async with self._download_semaphore:
+            self.task_queue.set_processing(task_id)
+            try:
+                if task["task_type"] == TASK_SINGLE:
+                    await self._exec_single_task(task, event=event, is_resume=is_resume)
+                elif task["task_type"] == TASK_FORWARDED:
+                    await self._exec_forwarded_task(task, event=event, is_resume=is_resume)
+                self.task_queue.set_done(task_id)
+            except Exception as e:
+                logger.exception(f"[_run_task] task_id={task_id} 执行异常: {e}")
+                self.task_queue.set_failed(task_id, str(e))
+                try:
+                    await self.bot_client.send_message(chat_id, f"❌ 任务失败: {str(e)}")
+                except Exception:
+                    pass
+
+    async def _exec_single_task(self, task: dict, event=None, is_resume: bool = False):
+        """执行单文件下载"""
+        chat_id = task["chat_id"]
+        msg_id = task["message_id"]
+
+        if is_resume:
+            msg = await self._refetch_message(chat_id, msg_id)
+            if not msg:
+                raise RuntimeError(f"无法重新获取消息 chat={chat_id} msg={msg_id}")
+            await self.bot_client.send_message(chat_id, f"🔄 恢复下载任务 (msg={msg_id})...")
+        else:
+            msg = event.message
+            await self.bot_client.send_message(chat_id, "开始下载媒体文件...")
+
+        logger.info(f"[_exec_single_task] chat={chat_id} msg={msg_id} is_resume={is_resume}")
+        success, result = await self.telegram_handler.process_media_from_message(msg)
+
+        if success:
+            logger.info(f"[_exec_single_task] chat={chat_id} msg={msg_id} 完成: {result['path']}")
+            await self.bot_client.send_message(
+                chat_id,
+                f"✅ {result['type']} 文件下载完成！\n"
+                f"文件名: {result['filename']}\n"
+                f"保存位置: {result['path']}"
+            )
+        else:
+            raise RuntimeError(result)
+
+    async def _exec_forwarded_task(self, task: dict, event=None, is_resume: bool = False):
+        """执行转发消息的原始媒体组下载，降级时走单文件"""
+        chat_id = task["chat_id"]
+        msg_id = task["message_id"]
+
+        if not self.user_client:
+            logger.info(f"[_exec_forwarded_task] task={task['task_id']} user client 不可用，降级单文件")
+            await self._exec_single_task(task, event=event, is_resume=is_resume)
+            return
+
+        original_peer_id = task.get("original_peer_id")
+        original_peer_type = task.get("original_peer_type")
+        original_msg_id = task.get("original_message_id")
+
+        if not original_peer_id or not original_msg_id:
+            logger.info(f"[_exec_forwarded_task] task={task['task_id']} 缺少原始来源信息，降级单文件")
+            await self._exec_single_task(task, event=event, is_resume=is_resume)
+            return
+
+        peer = self._build_peer(original_peer_id, original_peer_type)
+        try:
+            original_chat = await self.user_client.get_entity(peer)
+            logger.info(f"[_exec_forwarded_task] 获取原始来源: {getattr(original_chat, 'title', original_chat.id)}")
+        except Exception as e:
+            logger.warning(f"[_exec_forwarded_task] 获取原始来源失败，降级单文件: {e}")
+            await self._exec_single_task(task, event=event, is_resume=is_resume)
+            return
+
+        album_messages = await self._fetch_original_album(original_chat, original_msg_id)
+        logger.info(f"[_exec_forwarded_task] 原始媒体组共 {len(album_messages)} 条")
+
+        if len(album_messages) <= 1:
+            logger.info(f"[_exec_forwarded_task] 非媒体组，降级单文件")
+            await self._exec_single_task(task, event=event, is_resume=is_resume)
+            return
+
+        resume_hint = "🔄 恢复下载任务 — " if is_resume else ""
+        await self.bot_client.send_message(
+            chat_id,
+            f"{resume_hint}🔍 检测到原始消息包含 {len(album_messages)} 个文件，开始下载完整媒体组..."
+        )
+
+        downloaded_files = await self._download_messages_concurrently(
+            album_messages, client=self.user_client, tag=f"fwd_task={task['task_id']}"
+        )
+        if not downloaded_files:
+            raise RuntimeError("所有文件下载失败")
+
+        caption = album_messages[0].message or ""
+        group_id = album_messages[0].grouped_id or original_msg_id
+        success, result = await self.telegram_handler.process_media_group(group_id, downloaded_files, caption)
+
+        total = len(downloaded_files)
+        photo_count = sum(1 for f in downloaded_files if f["type"] == "photo")
+        video_count = sum(1 for f in downloaded_files if f["type"] == "video")
+        other_count = total - photo_count - video_count
+
+        if success:
+            summary = (
+                f"✅ 媒体组处理完成！\n"
+                f"📁 目录: {os.path.basename(result['directory'])}\n"
+                f"📊 统计: {total}个文件\n"
+                f"🖼️ 图片: {photo_count}张\n"
+                f"🎬 视频: {video_count}个"
+            )
+            if other_count > 0:
+                summary += f"\n📎 其他: {other_count}个"
+            await self.bot_client.send_message(chat_id, summary)
+        else:
+            raise RuntimeError(result)
+
+    # ------------------------------------------------------------------
+    # 重启恢复
+    # ------------------------------------------------------------------
+
+    async def resume_pending_tasks(self):
+        """启动时调用，恢复所有未完成任务"""
+        pending = self.task_queue.pending_tasks()
+        if not pending:
+            logger.info("[resume_pending_tasks] 没有未完成任务")
+            return
+
+        logger.info(f"[resume_pending_tasks] 发现 {len(pending)} 个未完成任务，开始恢复")
+        for task in pending:
+            logger.info(f"[resume_pending_tasks] 恢复任务 {task['task_id']} type={task['task_type']}")
+            asyncio.create_task(self._run_task(task["task_id"], is_resume=True))
+
+    # ------------------------------------------------------------------
+    # 媒体组（直接转发相册，非历史拉取路径）
+    # ------------------------------------------------------------------
+
     async def _handle_media_group(self, event):
-        """处理媒体组（相册）消息"""
         group_id = event.message.grouped_id
         msg_id = event.message.id
         try:
@@ -86,7 +248,6 @@ class EventHandler:
             await event.reply(f"处理媒体组时出错: {str(e)}")
 
     async def _process_media_group_with_delay(self, group_id):
-        """等待一段时间后处理完整的媒体组"""
         messages = []
         try:
             logger.debug(f"[_process_media_group_with_delay] group={group_id} 等待 {self.media_group_delay}s")
@@ -100,7 +261,8 @@ class EventHandler:
             caption = messages[0].text or "无标题媒体组"
             logger.info(f"[_process_media_group_with_delay] group={group_id} 共 {len(messages)} 条消息，caption='{caption[:50]}'")
 
-            downloaded_files = await self._download_messages_concurrently(messages, tag=f"group={group_id}")
+            async with self._download_semaphore:
+                downloaded_files = await self._download_messages_concurrently(messages, tag=f"group={group_id}")
 
             if not downloaded_files:
                 logger.error(f"[_process_media_group_with_delay] group={group_id} 所有文件下载失败")
@@ -110,7 +272,6 @@ class EventHandler:
             photo_count = sum(1 for f in downloaded_files if f["type"] == "photo")
             video_count = sum(1 for f in downloaded_files if f["type"] == "video")
             other_count = total_files - photo_count - video_count
-            logger.info(f"[_process_media_group_with_delay] group={group_id} 下载完成: {total_files}个 ({photo_count}图/{video_count}视频/{other_count}其他)")
 
             success, result = await self.telegram_handler.process_media_group(group_id, downloaded_files, caption)
 
@@ -130,7 +291,6 @@ class EventHandler:
                 except Exception as e:
                     logger.error(f"[_process_media_group_with_delay] group={group_id} 发送完成通知失败: {e}")
             else:
-                logger.error(f"[_process_media_group_with_delay] group={group_id} process_media_group 返回失败: {result}")
                 try:
                     await first_message.reply(f"❌ 媒体组处理失败: {result}")
                 except Exception as e:
@@ -146,137 +306,39 @@ class EventHandler:
         finally:
             self.media_groups.pop(group_id, None)
             self.group_tasks.pop(group_id, None)
-            logger.debug(f"[_process_media_group_with_delay] group={group_id} 状态已清理")
 
-    async def _handle_telegram_media_task(self, event):
-        """单文件下载任务包装，捕获异常避免 task 静默失败"""
-        msg_id = event.message.id
-        chat_id = event.chat_id
+    # ------------------------------------------------------------------
+    # 工具方法
+    # ------------------------------------------------------------------
+
+    async def _refetch_message(self, chat_id: int, msg_id: int):
+        """重启后通过 bot client 重新获取消息对象"""
         try:
-            async with self._download_semaphore:
-                await self._handle_telegram_media(event)
+            messages = await self.bot_client.get_messages(chat_id, ids=msg_id)
+            return messages
         except Exception as e:
-            logger.exception(f"[_handle_telegram_media_task] chat={chat_id} msg={msg_id} 任务异常: {e}")
-            try:
-                await event.reply(f"处理消息时出错: {str(e)}")
-            except Exception:
-                pass
+            logger.error(f"[_refetch_message] chat={chat_id} msg={msg_id} 获取失败: {e}")
+            return None
 
-    async def _handle_forwarded_media_task(self, event):
-        """转发媒体下载任务包装，降级时自动走单文件流程"""
-        msg_id = event.message.id
-        chat_id = event.chat_id
-        try:
-            async with self._download_semaphore:
-                handled = await self._handle_forwarded_media(event)
-                if not handled:
-                    await self._handle_telegram_media(event)
-        except Exception as e:
-            logger.exception(f"[_handle_forwarded_media_task] chat={chat_id} msg={msg_id} 任务异常: {e}")
-            try:
-                await event.reply(f"处理消息时出错: {str(e)}")
-            except Exception:
-                pass
+    def _extract_peer(self, peer) -> tuple[int, str]:
+        """从 Telethon Peer 对象提取 id 和类型字符串"""
+        if isinstance(peer, PeerChannel):
+            return peer.channel_id, "channel"
+        if isinstance(peer, PeerChat):
+            return peer.chat_id, "chat"
+        if isinstance(peer, PeerUser):
+            return peer.user_id, "user"
+        return int(str(peer)), "unknown"
 
-    async def _handle_telegram_media(self, event):
-        """处理单条 Telegram 媒体消息"""
-        msg_id = event.message.id
-        chat_id = event.chat_id
-        logger.info(f"[_handle_telegram_media] chat={chat_id} msg={msg_id} 开始下载")
-        await event.reply("开始下载媒体文件...")
-        try:
-            success, result = await self.telegram_handler.process_media(event)
-
-            if success:
-                logger.info(f"[_handle_telegram_media] chat={chat_id} msg={msg_id} 下载成功: {result['path']}")
-                await event.reply(
-                    f"✅ {result['type']} 文件下载完成！\n"
-                    f"文件名: {result['filename']}\n"
-                    f"保存位置: {result['path']}"
-                )
-            else:
-                logger.error(f"[_handle_telegram_media] chat={chat_id} msg={msg_id} 下载失败: {result}")
-                await event.reply(f"❌ 下载失败: {result}")
-        except Exception as e:
-            logger.exception(f"[_handle_telegram_media] chat={chat_id} msg={msg_id} 异常: {e}")
-            await event.reply(f"处理媒体文件时出错: {str(e)}")
-
-    async def _handle_forwarded_media(self, event):
-        """
-        处理转发的媒体消息。
-        如果 user client 可用，尝试从原始来源拉取完整媒体组。
-        返回 True 表示已处理，False 表示降级到普通单文件下载。
-        """
-        msg_id = event.message.id
-        if not self.user_client:
-            logger.debug(f"[_handle_forwarded_media] msg={msg_id} user client 不可用，降级")
-            return False
-
-        fwd = event.message.fwd_from
-        if not fwd or not fwd.from_id or not fwd.channel_post:
-            logger.debug(f"[_handle_forwarded_media] msg={msg_id} fwd_from 信息不完整，降级")
-            return False
-
-        original_msg_id = fwd.channel_post
-        logger.info(f"[_handle_forwarded_media] msg={msg_id} 原始来源 peer={fwd.from_id} original_msg_id={original_msg_id}")
-
-        try:
-            original_chat = await self.user_client.get_entity(fwd.from_id)
-            logger.info(f"[_handle_forwarded_media] msg={msg_id} 获取原始来源成功: {getattr(original_chat, 'title', original_chat.id)}")
-        except Exception as e:
-            logger.warning(f"[_handle_forwarded_media] msg={msg_id} 获取原始来源失败，降级: {e}")
-            return False
-
-        album_messages = await self._fetch_original_album(original_chat, original_msg_id)
-        logger.info(f"[_handle_forwarded_media] msg={msg_id} 原始媒体组共 {len(album_messages)} 条消息")
-
-        if len(album_messages) <= 1:
-            logger.info(f"[_handle_forwarded_media] msg={msg_id} 原始消息非媒体组，降级为单文件下载")
-            return False
-
-        await event.reply(f"🔍 检测到原始消息包含 {len(album_messages)} 个文件，开始下载完整媒体组...")
-
-        downloaded_files = await self._download_messages_concurrently(album_messages, client=self.user_client, tag=f"fwd_msg={msg_id}")
-
-        if not downloaded_files:
-            logger.error(f"[_handle_forwarded_media] 所有文件下载失败")
-            await event.reply("❌ 媒体组文件下载失败")
-            return True
-
-        caption = album_messages[0].message or ""
-        group_id = album_messages[0].grouped_id or original_msg_id
-        logger.info(f"[_handle_forwarded_media] 开始处理媒体组 group={group_id} caption='{caption[:50]}'")
-
-        success, result = await self.telegram_handler.process_media_group(group_id, downloaded_files, caption)
-
-        total = len(downloaded_files)
-        photo_count = sum(1 for f in downloaded_files if f["type"] == "photo")
-        video_count = sum(1 for f in downloaded_files if f["type"] == "video")
-        other_count = total - photo_count - video_count
-
-        if success:
-            logger.info(f"[_handle_forwarded_media] group={group_id} 处理完成: {result['directory']}")
-            summary = (
-                f"✅ 媒体组处理完成！\n"
-                f"📁 目录: {os.path.basename(result['directory'])}\n"
-                f"📊 统计: {total}个文件\n"
-                f"🖼️ 图片: {photo_count}张\n"
-                f"🎬 视频: {video_count}个"
-            )
-            if other_count > 0:
-                summary += f"\n📎 其他: {other_count}个"
-            await event.reply(summary)
-        else:
-            logger.error(f"[_handle_forwarded_media] group={group_id} 处理失败: {result}")
-            await event.reply(f"❌ 媒体组处理失败: {result}")
-
-        return True
+    def _build_peer(self, peer_id: int, peer_type: str):
+        """从持久化数据重建 Peer 对象"""
+        if peer_type == "channel":
+            return PeerChannel(peer_id)
+        if peer_type == "chat":
+            return PeerChat(peer_id)
+        return PeerUser(peer_id)
 
     async def _download_messages_concurrently(self, messages, client=None, tag=""):
-        """
-        并发下载消息列表中的所有媒体文件。
-        client 为 None 时每条消息用自身的 download_media（bot client 路径）。
-        """
         media_messages = [(i, msg) for i, msg in enumerate(messages) if msg.media]
         if not media_messages:
             return []
@@ -315,20 +377,17 @@ class EventHandler:
                 return None
 
         results = await asyncio.gather(*(download_one(i, msg) for i, msg in media_messages))
-
         downloaded = [r for r in results if r is not None]
-        # 保持原始消息顺序
         downloaded.sort(key=lambda f: f["index"])
 
         failed = len(media_messages) - len(downloaded)
         if failed:
             logger.warning(f"[_download_messages_concurrently] {tag} {failed} 个文件下载失败")
-        logger.info(f"[_download_messages_concurrently] {tag} 完成: {len(downloaded)}/{len(media_messages)} 个文件下载成功")
+        logger.info(f"[_download_messages_concurrently] {tag} 完成: {len(downloaded)}/{len(media_messages)} 个")
         return downloaded
 
     async def _fetch_original_album(self, chat, msg_id):
-        """从原始来源获取完整媒体组"""
-        logger.info(f"[_fetch_original_album] chat={getattr(chat, 'id', chat)} msg_id={msg_id} 获取窗口消息")
+        logger.info(f"[_fetch_original_album] chat={getattr(chat, 'id', chat)} msg_id={msg_id}")
         try:
             window = await self.user_client.get_messages(
                 chat,
@@ -336,8 +395,6 @@ class EventHandler:
                 max_id=msg_id + 10,
                 limit=20,
             )
-            logger.debug(f"[_fetch_original_album] 获取到 {len(window)} 条消息")
-
             target_grouped_id = None
             for msg in window:
                 if msg.id == msg_id:
@@ -351,7 +408,6 @@ class EventHandler:
             album = [msg for msg in window if msg.grouped_id == target_grouped_id]
             logger.info(f"[_fetch_original_album] grouped_id={target_grouped_id} 找到 {len(album)} 条消息")
             return album
-
         except Exception as e:
-            logger.exception(f"[_fetch_original_album] 获取媒体组消息异常: {e}")
+            logger.exception(f"[_fetch_original_album] 异常: {e}")
             return []

@@ -173,6 +173,71 @@ class TelegramHandler:
             logger.exception(f"[process_media] msg={msg_id} 处理异常: {e}")
             return False, str(e)
 
+    async def process_media_from_message(self, msg):
+        """处理单条 Telegram 消息对象（Message，非 event），用于重启恢复"""
+        msg_id = msg.id
+        logger.info(f"[process_media_from_message] 开始处理 msg={msg_id}")
+
+        try:
+            media = msg.media
+            if not media:
+                logger.warning(f"[process_media_from_message] msg={msg_id} 没有媒体内容")
+                return False, "没有检测到媒体文件"
+
+            media_type, target_dir = self._get_media_type_and_dir(media)
+            logger.debug(f"[process_media_from_message] msg={msg_id} 媒体类型={media_type} 目标目录={target_dir}")
+
+            logger.info(f"[process_media_from_message] msg={msg_id} 开始下载到临时目录 {TELEGRAM_TEMP_DIR}")
+            downloaded_file = await msg.download_media(file=TELEGRAM_TEMP_DIR)
+            if not downloaded_file:
+                logger.error(f"[process_media_from_message] msg={msg_id} 下载失败，download_media 返回 None")
+                return False, "文件下载失败"
+            logger.info(f"[process_media_from_message] msg={msg_id} 下载完成: {downloaded_file}")
+
+            temp_basename = os.path.basename(downloaded_file)
+            temp_stem, temp_ext = os.path.splitext(temp_basename)
+
+            if hasattr(media, "document"):
+                mime_type = media.document.mime_type
+                mime_ext = self._get_ext_from_mime(mime_type)
+                ext = temp_ext if temp_ext else (mime_ext or "")
+            else:
+                ext = ".jpg"
+
+            title = self._extract_title(msg.message) if msg.message else None
+            if title and title != "无标题媒体组":
+                if os.path.splitext(temp_stem)[1]:
+                    final_name = temp_basename
+                else:
+                    final_name = f"{title}{ext}"
+            else:
+                final_name = temp_basename
+
+            target_path = os.path.join(target_dir, final_name)
+            if os.path.exists(target_path):
+                stem, ext2 = os.path.splitext(final_name)
+                target_path = os.path.join(
+                    target_dir, f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext2}"
+                )
+
+            logger.info(f"[process_media_from_message] msg={msg_id} 移动文件: {downloaded_file} -> {target_path}")
+            success, result = move_file(downloaded_file, target_path)
+
+            if success:
+                logger.info(f"[process_media_from_message] msg={msg_id} 处理完成: {result}")
+                return True, {
+                    "type": media_type,
+                    "path": result,
+                    "filename": os.path.basename(result),
+                }
+            else:
+                logger.error(f"[process_media_from_message] msg={msg_id} 移动文件失败: {result}")
+                return False, f"移动文件失败: {result}"
+
+        except Exception as e:
+            logger.exception(f"[process_media_from_message] msg={msg_id} 处理异常: {e}")
+            return False, str(e)
+
     async def process_media_group(self, group_id, media_files, caption):
         """处理媒体组文件"""
         total_files = len(media_files)

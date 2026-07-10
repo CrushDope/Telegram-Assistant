@@ -71,6 +71,8 @@ async def main():
         event_handler.register_handlers(bot_client, user_client)
         logger.info("事件处理器注册完成")
 
+        await event_handler.resume_pending_tasks()
+
         loop = asyncio.get_event_loop()
 
         async def shutdown(signal_=None):

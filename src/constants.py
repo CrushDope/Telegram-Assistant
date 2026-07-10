@@ -11,3 +11,5 @@ TELEGRAM_VIDEOS_DIR = os.path.join(TELEGRAM_DEST_DIR, "videos")
 TELEGRAM_AUDIOS_DIR = os.path.join(TELEGRAM_DEST_DIR, "audios")
 TELEGRAM_PHOTOS_DIR = os.path.join(TELEGRAM_DEST_DIR, "photos")
 TELEGRAM_OTHERS_DIR = os.path.join(TELEGRAM_DEST_DIR, "others")
+
+TASK_QUEUE_FILE = os.path.join(CONFIG_DIR, "task_queue.json")
