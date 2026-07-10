@@ -33,6 +33,7 @@ async def main():
     """主程序入口"""
     logger.info("=" * 60)
     logger.info("Telegram Assistant 启动中...")
+    logger.info("版本: 2026-07-10")
     logger.info("=" * 60)
 
     try:
