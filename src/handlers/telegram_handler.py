@@ -30,6 +30,14 @@ MIME_TO_EXT = {
     "image/png": ".png",
     "image/gif": ".gif",
     "image/webp": ".webp",
+    "application/zip": ".zip",
+    "application/x-zip-compressed": ".zip",
+    "application/vnd.rar": ".rar",
+    "application/x-rar-compressed": ".rar",
+    "application/x-7z-compressed": ".7z",
+    "application/x-tar": ".tar",
+    "application/gzip": ".gz",
+    "application/x-gzip": ".gz",
 }
 
 
@@ -108,28 +116,41 @@ class TelegramHandler:
                 return False, "文件下载失败"
             logger.info(f"[process_media] msg={msg_id} 下载完成: {downloaded_file}")
 
-            temp_stem, temp_ext = os.path.splitext(os.path.basename(downloaded_file))
-            logger.debug(f"[process_media] msg={msg_id} 临时文件名={temp_stem} 临时扩展名={temp_ext}")
+            temp_basename = os.path.basename(downloaded_file)
+            temp_stem, temp_ext = os.path.splitext(temp_basename)
+            logger.debug(f"[process_media] msg={msg_id} 临时文件名={temp_basename}")
 
             if hasattr(media, "document"):
                 mime_type = media.document.mime_type
-                ext = self._get_ext_from_mime(mime_type) or temp_ext
-                logger.debug(f"[process_media] msg={msg_id} mime_type={mime_type} 最终扩展名={ext}")
+                mime_ext = self._get_ext_from_mime(mime_type)
+                # 优先用 Telethon 下载的实际扩展名；
+                # 仅当 temp 文件名看起来是纯 ID（无点号）时才回退到 mime 推导
+                ext = temp_ext if temp_ext else (mime_ext or "")
+                logger.debug(f"[process_media] msg={msg_id} mime_type={mime_type} temp_ext={temp_ext} 最终扩展名={ext}")
             else:
                 ext = ".jpg"
 
             title = self._extract_title(event.message.message) if event.message.message else None
             if title and title != "无标题媒体组":
                 filename = title
-                logger.debug(f"[process_media] msg={msg_id} 使用消息标题作为文件名: {filename}")
+                # 分卷文件（如 .7z.001）需要保留完整原始文件名，不能仅用标题+单扩展名重组
+                # 检测双扩展名特征：stem 本身还带有扩展名
+                if os.path.splitext(temp_stem)[1]:
+                    # temp_stem 形如 "archive.7z"，说明是分卷，保留完整原始文件名
+                    final_name = temp_basename
+                    logger.debug(f"[process_media] msg={msg_id} 检测到分卷文件，保留原始文件名: {final_name}")
+                else:
+                    final_name = f"{filename}{ext}"
+                logger.debug(f"[process_media] msg={msg_id} 使用消息标题: {filename}")
             else:
-                filename = temp_stem
-                logger.debug(f"[process_media] msg={msg_id} 使用原始文件名: {filename}")
+                final_name = temp_basename
+                logger.debug(f"[process_media] msg={msg_id} 使用原始文件名: {final_name}")
 
-            target_path = os.path.join(target_dir, f"{filename}{ext}")
+            target_path = os.path.join(target_dir, final_name)
             if os.path.exists(target_path):
+                stem, ext2 = os.path.splitext(final_name)
                 new_target = os.path.join(
-                    target_dir, f"{filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+                    target_dir, f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext2}"
                 )
                 logger.warning(f"[process_media] msg={msg_id} 目标文件已存在，重命名为: {os.path.basename(new_target)}")
                 target_path = new_target
@@ -184,17 +205,20 @@ class TelegramHandler:
 
             video_names = {}
             for i, video in enumerate(videos):
-                original_ext = os.path.splitext(video['original_filename'])[1]
-                new_filename = (
-                    f"{directory_name}{original_ext}"
-                    if video_count == 1
-                    else f"{directory_name}_{i+1}{original_ext}"
-                )
+                original_filename = video['original_filename']
+                original_stem, original_ext = os.path.splitext(original_filename)
+                # 分卷文件（如 archive.7z.001）：stem 本身还带扩展名，保留完整原始文件名
+                if os.path.splitext(original_stem)[1]:
+                    new_filename = original_filename
+                elif video_count == 1:
+                    new_filename = f"{directory_name}{original_ext}"
+                else:
+                    new_filename = f"{directory_name}_{i+1}{original_ext}"
                 new_filename = self._sanitize_filename(new_filename)
                 target_path = os.path.join(group_dir, new_filename)
                 shutil.move(video['temp_path'], target_path)
-                video_names[video['original_filename']] = new_filename
-                logger.info(f"[process_media_group] group={group_id} 视频: {video['original_filename']} -> {new_filename}")
+                video_names[original_filename] = new_filename
+                logger.info(f"[process_media_group] group={group_id} 视频: {original_filename} -> {new_filename}")
 
             other_names = {}
             for other in others:
