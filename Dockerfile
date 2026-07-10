@@ -16,9 +16,7 @@ RUN mkdir -p \
     downloads/telegram/audios \
     downloads/telegram/photos \
     downloads/telegram/others \
-    downloads/youtube \
-    temp/telegram \
-    temp/youtube
+    temp/telegram
 
 # 设置脚本权限
 RUN chmod +x entrypoint.sh

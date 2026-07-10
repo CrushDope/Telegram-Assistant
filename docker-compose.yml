@@ -5,8 +5,7 @@ services:
     volumes:
       - ./config:/app/config
       - ./downloads/telegram:/app/downloads/telegram
-      - ./downloads/youtube:/app/downloads/youtube
-      - ./downloads/temp:/app/temp
+      - ./temp:/app/temp
 
     restart: unless-stopped
     container_name: telegram_assistant

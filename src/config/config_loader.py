@@ -12,6 +12,11 @@ def load_config():
     default_config = {
         "api_id": "",
         "api_hash": "",
+        "user_account": {
+            "enabled": False,
+            "phone": "",
+            "session_name": "user_session",
+        },
         "bot_account": {
             "token": "",
             "session_name": "bot_session",
