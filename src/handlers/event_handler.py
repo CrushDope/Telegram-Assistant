@@ -21,6 +21,11 @@ class EventHandler:
         self.media_group_delay = config.get("media_group_delay", 3.0)
         self.user_client = None
 
+        # 同时进行的下载任务上限，避免多任务并发时 Telethon 连接互相竞争
+        max_concurrent = config.get("max_concurrent_downloads", 2)
+        self._download_semaphore = asyncio.Semaphore(max_concurrent)
+        logger.info(f"[EventHandler] 最大并发下载数: {max_concurrent}")
+
     def register_handlers(self, client, user_client=None):
         """注册所有事件处理器"""
         self.user_client = user_client
@@ -148,7 +153,8 @@ class EventHandler:
         msg_id = event.message.id
         chat_id = event.chat_id
         try:
-            await self._handle_telegram_media(event)
+            async with self._download_semaphore:
+                await self._handle_telegram_media(event)
         except Exception as e:
             logger.exception(f"[_handle_telegram_media_task] chat={chat_id} msg={msg_id} 任务异常: {e}")
             try:
@@ -161,9 +167,10 @@ class EventHandler:
         msg_id = event.message.id
         chat_id = event.chat_id
         try:
-            handled = await self._handle_forwarded_media(event)
-            if not handled:
-                await self._handle_telegram_media(event)
+            async with self._download_semaphore:
+                handled = await self._handle_forwarded_media(event)
+                if not handled:
+                    await self._handle_telegram_media(event)
         except Exception as e:
             logger.exception(f"[_handle_forwarded_media_task] chat={chat_id} msg={msg_id} 任务异常: {e}")
             try:

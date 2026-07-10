@@ -29,6 +29,7 @@ def load_config():
         },
         "send_file": False,
         "media_group_delay": 3.0,
+        "max_concurrent_downloads": 2,
     }
 
     try:
