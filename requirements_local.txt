@@ -1,0 +1,11 @@
+pyaes
+pyasn1
+python-socks
+PyYAML
+rsa
+setuptools
+Telethon
+wheel
+yt-dlp
+f2
+apscheduler
