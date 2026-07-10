@@ -45,14 +45,13 @@ class EventHandler:
                     return
 
                 if event.message.media and event.message.fwd_from:
-                    logger.info(f"[handle_message] chat={chat_id} msg={msg_id} 检测到转发媒体消息，尝试拉取原始媒体组")
-                    handled = await self._handle_forwarded_media(event)
-                    if handled:
-                        return
+                    logger.info(f"[handle_message] chat={chat_id} msg={msg_id} 检测到转发媒体消息，创建独立任务")
+                    asyncio.create_task(self._handle_forwarded_media_task(event))
+                    return
 
                 if event.message.media:
-                    logger.info(f"[handle_message] chat={chat_id} msg={msg_id} 处理单条媒体消息")
-                    await self._handle_telegram_media(event)
+                    logger.info(f"[handle_message] chat={chat_id} msg={msg_id} 处理单条媒体消息，创建独立任务")
+                    asyncio.create_task(self._handle_telegram_media_task(event))
                 else:
                     logger.debug(f"[handle_message] chat={chat_id} msg={msg_id} 无媒体内容，忽略")
 
@@ -143,6 +142,34 @@ class EventHandler:
             self.media_groups.pop(group_id, None)
             self.group_tasks.pop(group_id, None)
             logger.debug(f"[_process_media_group_with_delay] group={group_id} 状态已清理")
+
+    async def _handle_telegram_media_task(self, event):
+        """单文件下载任务包装，捕获异常避免 task 静默失败"""
+        msg_id = event.message.id
+        chat_id = event.chat_id
+        try:
+            await self._handle_telegram_media(event)
+        except Exception as e:
+            logger.exception(f"[_handle_telegram_media_task] chat={chat_id} msg={msg_id} 任务异常: {e}")
+            try:
+                await event.reply(f"处理消息时出错: {str(e)}")
+            except Exception:
+                pass
+
+    async def _handle_forwarded_media_task(self, event):
+        """转发媒体下载任务包装，降级时自动走单文件流程"""
+        msg_id = event.message.id
+        chat_id = event.chat_id
+        try:
+            handled = await self._handle_forwarded_media(event)
+            if not handled:
+                await self._handle_telegram_media(event)
+        except Exception as e:
+            logger.exception(f"[_handle_forwarded_media_task] chat={chat_id} msg={msg_id} 任务异常: {e}")
+            try:
+                await event.reply(f"处理消息时出错: {str(e)}")
+            except Exception:
+                pass
 
     async def _handle_telegram_media(self, event):
         """处理单条 Telegram 媒体消息"""
